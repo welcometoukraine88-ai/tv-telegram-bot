@@ -94,7 +94,7 @@ def set_okx_leverage(inst_id, leverage):
 
 def execute_okx_trade(symbol, side_type, margin_usdt):
     """
-    Рассчитывает объем позиции в монетах на основе указанных USDT и открывает ордер (tgtCcy="base")
+    Рассчитывает объем позиции в монетах на основе указанной маржи и открывает ордер на SWAP
     """
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
@@ -104,33 +104,33 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     # 1. Получаем макс. плечо и текущую рыночную цену
     max_lev, last_price = get_max_leverage_and_ticker(inst_id)
     if last_price <= 0:
-        return False, "Не удалось получить текущую цену монеты с OKX."
+        return False, f"Не удалось получить текущую цену для {inst_id} с OKX."
 
     # 2. Выставляем максимальное плечо
     set_okx_leverage(inst_id, max_lev)
 
-    # 3. Расчет позиционного объема в USDT (Номинал позиции = Маржа * Плечо)
+    # 3. Расчет объёма в USDT (Номинал позиции = Маржа * Плечо)
     target_notional_usdt = margin_usdt * max_lev
 
     # 4. Расчет количества монет (Номинал USDT / Текущая цена)
     coins_qty = target_notional_usdt / last_price
     formatted_sz = f"{coins_qty:.6f}".rstrip('0').rstrip('.')
 
-    # 5. Отправка рыночного ордера с типом tgtCcy="base"
+    # 5. Отправка рыночного ордера без tgtCcy (для SWAP)
     order_body = {
         "instId": inst_id,
         "tdMode": "cross",
         "side": okx_side,
         "posSide": pos_side,
         "ordType": "market",
-        "sz": formatted_sz,
-        "tgtCcy": "base"
+        "sz": formatted_sz
     }
 
     res = okx_request("POST", "/api/v5/trade/order", order_body)
 
     if res.get("code") == "0":
         return True, (
+            f"Инструмент: `{inst_id}`\n"
             f"Плечо: **{max_lev}x** (Максимальное)\n"
             f"Введенная маржа: **${margin_usdt}**\n"
             f"Общий объем позиции: **~${round(target_notional_usdt, 2)}** ({formatted_sz} {clean_symbol})\n"
