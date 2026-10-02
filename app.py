@@ -7,6 +7,7 @@ import hmac
 import hashlib
 from flask import Flask, request
 import requests
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
@@ -50,29 +51,34 @@ def okx_request(method, request_path, body_data=None):
         res = requests.post(url, data=body_str, headers=headers, timeout=10)
     return res.json()
 
+def send_telegram_msg(text):
+    """Вспомогательная функция отправки сообщения"""
+    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    })
+
 def get_max_leverage_and_ticker(inst_id):
-    """
-    Получает максимально допустимое плечо инструмента и текущую рыночную цену
-    """
-    max_lev = 20  # Значение по умолчанию
+    """Получает максимально допустимое плечо инструмента и текущую рыночную цену"""
+    max_lev = 20
     last_price = 0.0
 
     try:
-        # 1. Запрос параметров инструмента (здесь указано максимальное плечо пары, например 50x)
+        # 1. Запрос параметров инструмента (макс. плечо)
         inst_res = okx_request("GET", f"/api/v5/public/instruments?instType=SWAP&instId={inst_id}")
         if inst_res.get("code") == "0" and inst_res.get("data"):
             max_lev = int(inst_res["data"][0].get("lever", 20))
 
-        # 2. Если в instruments плечо не найдено, запрашиваем через leverage-lanes
+        # 2. Если не нашли, ищем через leverage-lanes
         if max_lev == 20:
             lev_res = okx_request("GET", f"/api/v5/public/leverage-lanes?instId={inst_id}&mgnMode=cross")
             if lev_res.get("code") == "0" and lev_res.get("data"):
-                # Берем максимальное значение среди доступных уровней
                 levers = [int(item.get("maxLever", 20)) for item in lev_res["data"] if "maxLever" in item]
                 if levers:
                     max_lev = max(levers)
 
-        # 3. Запрос текущей рыночной цены (last price)
+        # 3. Запрос цены
         ticker_res = okx_request("GET", f"/api/v5/market/ticker?instId={inst_id}")
         if ticker_res.get("code") == "0" and ticker_res.get("data"):
             last_price = float(ticker_res["data"][0].get("last", 0.0))
@@ -140,6 +146,128 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         msg = res.get("data", [{}])[0].get("sMsg") or res.get("msg")
         return False, f"Ошибка OKX: {msg}"
 
+# ================= РАСЧЕТ RSI И ЗАКРЫТИЕ ПОЗИЦИЙ С PNL =================
+
+def calculate_rsi(prices, period=14):
+    """Рассчитывает классический индикатор RSI(14) по массиву цен закрытия"""
+    if len(prices) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i - 1]
+        if change > 0:
+            gains.append(change)
+            losses.append(0.0)
+        else:
+            gains.append(abs(change))
+            losses.append(abs(change))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return round(rsi, 2)
+
+def get_15m_rsi(inst_id):
+    """Получает свечи 15m с OKX и рассчитывает RSI(14)"""
+    res = okx_request("GET", f"/api/v5/market/candles?instId={inst_id}&bar=15m&limit=50")
+    if res.get("code") == "0" and res.get("data"):
+        candles = res["data"][::-1]
+        close_prices = [float(c[4]) for c in candles]
+        return calculate_rsi(close_prices, 14)
+    return None
+
+def close_okx_position(inst_id, pos_side):
+    """Полностью закрывает позицию по рынку (Market Close)"""
+    body = {
+        "instId": inst_id,
+        "mgnMode": "cross",
+        "posSide": pos_side
+    }
+    return okx_request("POST", "/api/v5/trade/close-position", body)
+
+def check_and_close_positions_by_rsi():
+    """Фоновая задача: проверяет открытые позиции на закрытии 15m свечи и выводит PnL"""
+    try:
+        # Получаем открытые позиции по SWAP
+        res = okx_request("GET", "/api/v5/account/positions?instType=SWAP")
+        if res.get("code") != "0" or not res.get("data"):
+            return
+
+        positions = res["data"]
+        for pos in positions:
+            pos_qty = float(pos.get("pos", 0))
+            if pos_qty == 0:
+                continue
+
+            inst_id = pos.get("instId")
+            pos_side = pos.get("posSide")  # "long" или "short"
+
+            # Считываем PnL до закрытия позиции
+            pnl_usdt = float(pos.get("upl", 0.0))  # Unreleased PnL в USDT
+            pnl_ratio = float(pos.get("uplRatio", 0.0)) * 100  # PnL в процентах
+
+            # Рассчитываем RSI 15m
+            rsi = get_15m_rsi(inst_id)
+            if rsi is None:
+                continue
+
+            # Условия закрытия
+            should_close = False
+            reason = ""
+
+            if pos_side == "long" and rsi >= 70:
+                should_close = True
+                reason = f"RSI(15m) = **{rsi}** (≥ 70 — Перекупленность)"
+            elif pos_side == "short" and rsi <= 30:
+                should_close = True
+                reason = f"RSI(15m) = **{rsi}** (≤ 30 — Перепроданность)"
+
+            if should_close:
+                close_res = close_okx_position(inst_id, pos_side)
+                if close_res.get("code") == "0":
+                    pnl_emoji = "🟩" if pnl_usdt >= 0 else "🟥"
+                    pnl_str = f"+${pnl_usdt:.2f}" if pnl_usdt >= 0 else f"-${abs(pnl_usdt):.2f}"
+                    pnl_ratio_str = f"+{pnl_ratio:.2f}%" if pnl_ratio >= 0 else f"{pnl_ratio:.2f}%"
+
+                    send_telegram_msg(
+                        f"🚨 **АВТО-ЗАКРЫТИЕ ПОЗИЦИИ BY RSI**\n\n"
+                        f"Монета: `{inst_id}`\n"
+                        f"Позиция: **{pos_side.upper()}**\n"
+                        f"Причина: {reason}\n\n"
+                        f"📊 **РЕЗУЛЬТАТ СДЕЛКИ:**\n"
+                        f"PnL (USDT): {pnl_emoji} **{pnl_str}**\n"
+                        f"PnL (%): {pnl_emoji} **{pnl_ratio_str}**\n\n"
+                        f"Статус: ✅ **Позиция закрыта**"
+                    )
+                else:
+                    err_msg = close_res.get("msg") or "Ошибка закрытия"
+                    send_telegram_msg(
+                        f"⚠️ **Ошибка закрытия позиции `{inst_id}` ({pos_side}):** `{err_msg}`"
+                    )
+    except Exception as e:
+        print(f"Ошибка при проверке RSI позиций: {e}")
+
+# ================= ПЛАНИРОВЩИК ЗАДАЧ (15m) =================
+
+scheduler = BackgroundScheduler()
+# Запуск каждые 15 минут (в 00, 15, 30, 45 минут каждого часа)
+scheduler.add_job(check_and_close_positions_by_rsi, 'cron', minute='0,15,30,45')
+scheduler.start()
+
+# ================= TELEGRAM & WEBHOOKS =================
+
 def send_telegram_signal(symbol, signal_type, raw_text):
     """Отправляет сигнал в Telegram с кнопками"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -160,14 +288,6 @@ def send_telegram_signal(symbol, signal_type, raw_text):
     }
 
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown", "reply_markup": reply_markup})
-
-def send_telegram_msg(text):
-    """Вспомогательная функция отправки сообщения"""
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    })
 
 def parse_alert(text):
     """Парсит алерт от TradingView"""
@@ -192,7 +312,6 @@ def webhook():
 def telegram_callback():
     data = request.get_json()
 
-    # 1. Обработка текстовых сообщений (когда пользователь вводит сумму USDT)
     if "message" in data and "text" in data["message"]:
         chat_id = str(data["message"]["chat"]["id"])
         user_text = data["message"]["text"].strip()
@@ -215,7 +334,6 @@ def telegram_callback():
             except ValueError:
                 send_telegram_msg("⚠️ Неверный формат! Введи просто число (например: `50` или `100`).")
 
-    # 2. Обработка нажатий на inline-кнопки
     elif "callback_query" in data:
         query = data["callback_query"]
         callback_id = query["id"]
@@ -233,7 +351,6 @@ def telegram_callback():
             side_type = parts[1]
             symbol = parts[2]
 
-            # Запоминаем, что ждем ввод суммы от этого чата
             PENDING_TRADES[chat_id] = {"symbol": symbol, "side_type": side_type}
 
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id})
