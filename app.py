@@ -51,22 +51,37 @@ def okx_request(method, request_path, body_data=None):
     return res.json()
 
 def get_max_leverage_and_ticker(inst_id):
-    """Получает максимальное доступное плечо и текущую рыночную цену инструмента"""
+    """
+    Получает максимально допустимое плечо инструмента и текущую рыночную цену
+    """
+    max_lev = 20  # Значение по умолчанию
+    last_price = 0.0
+
     try:
-        # 1. Запрос максимального плеча
-        lev_res = okx_request("GET", f"/api/v5/public/leverage-lanes?instId={inst_id}&mgnMode=cross")
-        max_lev = 20  # Дефолтное плечо
-        if lev_res.get("code") == "0" and lev_res.get("data"):
-            max_lev = int(lev_res["data"][0].get("maxLever", "20"))
+        # 1. Запрос параметров инструмента (здесь указано максимальное плечо пары, например 50x)
+        inst_res = okx_request("GET", f"/api/v5/public/instruments?instType=SWAP&instId={inst_id}")
+        if inst_res.get("code") == "0" and inst_res.get("data"):
+            max_lev = int(inst_res["data"][0].get("lever", 20))
 
-        # 2. Запрос текущей рыночной цены (last price)
+        # 2. Если в instruments плечо не найдено, запрашиваем через leverage-lanes
+        if max_lev == 20:
+            lev_res = okx_request("GET", f"/api/v5/public/leverage-lanes?instId={inst_id}&mgnMode=cross")
+            if lev_res.get("code") == "0" and lev_res.get("data"):
+                # Берем максимальное значение среди доступных уровней
+                levers = [int(item.get("maxLever", 20)) for item in lev_res["data"] if "maxLever" in item]
+                if levers:
+                    max_lev = max(levers)
+
+        # 3. Запрос текущей рыночной цены (last price)
         ticker_res = okx_request("GET", f"/api/v5/market/ticker?instId={inst_id}")
-        price = float(ticker_res["data"][0]["last"]) if ticker_res.get("code") == "0" and ticker_res.get("data") else 0.0
+        if ticker_res.get("code") == "0" and ticker_res.get("data"):
+            last_price = float(ticker_res["data"][0].get("last", 0.0))
 
-        return max_lev, price
+        return max_lev, last_price
+
     except Exception as e:
-        print(f"Ошибка получения данных тикера: {e}")
-        return 20, 0.0
+        print(f"Ошибка получения данных тикера/плеча: {e}")
+        return 20, last_price
 
 def set_okx_leverage(inst_id, leverage):
     """Устанавливает максимальное плечо на OKX"""
