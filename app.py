@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import math
 import base64
 import hmac
 import hashlib
@@ -52,45 +53,15 @@ def okx_request(method, request_path, body_data=None):
     return res.json()
 
 def send_telegram_msg(text):
-    """Вспомогательная функция отправки сообщения"""
+    """Вспомогательная функция отправки сообщения в Telegram"""
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
         "parse_mode": "Markdown"
     })
 
-def get_max_leverage_and_ticker(inst_id):
-    """Получает максимально допустимое плечо инструмента и текущую рыночную цену"""
-    max_lev = 20
-    last_price = 0.0
-
-    try:
-        # 1. Запрос параметров инструмента (макс. плечо)
-        inst_res = okx_request("GET", f"/api/v5/public/instruments?instType=SWAP&instId={inst_id}")
-        if inst_res.get("code") == "0" and inst_res.get("data"):
-            max_lev = int(inst_res["data"][0].get("lever", 20))
-
-        # 2. Если не нашли, ищем через leverage-lanes
-        if max_lev == 20:
-            lev_res = okx_request("GET", f"/api/v5/public/leverage-lanes?instId={inst_id}&mgnMode=cross")
-            if lev_res.get("code") == "0" and lev_res.get("data"):
-                levers = [int(item.get("maxLever", 20)) for item in lev_res["data"] if "maxLever" in item]
-                if levers:
-                    max_lev = max(levers)
-
-        # 3. Запрос цены
-        ticker_res = okx_request("GET", f"/api/v5/market/ticker?instId={inst_id}")
-        if ticker_res.get("code") == "0" and ticker_res.get("data"):
-            last_price = float(ticker_res["data"][0].get("last", 0.0))
-
-        return max_lev, last_price
-
-    except Exception as e:
-        print(f"Ошибка получения данных тикера/плеча: {e}")
-        return 20, last_price
-
 def set_okx_leverage(inst_id, leverage):
-    """Устанавливает максимальное плечо на OKX"""
+    """Устанавливает плечо на OKX"""
     body = {
         "instId": inst_id,
         "lever": str(leverage),
@@ -98,7 +69,7 @@ def set_okx_leverage(inst_id, leverage):
     }
     return okx_request("POST", "/api/v5/account/set-leverage", body)
 
-import math
+# ================= РАСЧЕТ И ИСПОЛНЕНИЕ ОРДЕРА В КОНТРАКТАХ =================
 
 def execute_okx_trade(symbol, side_type, margin_usdt):
     """
@@ -113,10 +84,10 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     max_lev = 20
     last_price = 0.0
     ct_val = 1.0   # Количество монет в 1 контракте
-    lot_sz = 1.0   # Минимальный шаг/количество контрактов (обычно 1)
+    lot_sz = 1.0   # Минимальный шаг лота
 
     try:
-        # 1. Получаем спецификацию инструмента из OKX
+        # 1. Запрос параметров инструмента (макс. плечо, размер контракта, шаг лота)
         inst_res = okx_request("GET", f"/api/v5/public/instruments?instType=SWAP&instId={inst_id}")
         if inst_res.get("code") == "0" and inst_res.get("data"):
             inst_data = inst_res["data"][0]
@@ -135,40 +106,36 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     if last_price <= 0:
         return False, f"Не удалось получить текущую цену для `{inst_id}` с OKX."
 
-    # 3. Расчет стоимости 1 минимального лота (в USDT)
-    min_contract_notional = ct_val * lot_sz * last_price  # Полная стоимость 1 лота без плеча
-    min_margin_required = min_contract_notional / max_lev  # Минимальная маржа с учетом плеча
+    # 3. Расчет стоимости 1 минимального контракта в USDT
+    min_contract_notional = ct_val * lot_sz * last_price
+    min_margin_required = min_contract_notional / max_lev
 
-    # 4. Проверка: достаточно ли введенной маржи
+    # 4. Проверка маржи
     if margin_usdt < min_margin_required:
-        # Округляем до 2 знаков с запасом вверх
         suggested_margin = round(min_margin_required + 0.01, 2)
         return False, (
             f"❌ **Суммы ${margin_usdt} недостаточно для входа в {inst_id}!**\n\n"
-            f"• Цена монеты: **${last_price:,.2f}**\n"
-            f"• Максимальное плечо: **{max_lev}x**\n"
-            f"• Стоимость 1 мин. контракта: **${min_contract_notional:.2f}**\n\n"
+            f"• Текущая цена: **${last_price:,.2f}**\n"
+            f"• Макс. плечо: **{max_lev}x**\n"
+            f"• Стоимость 1 контракта: **${min_contract_notional:.2f}**\n\n"
             f"👉 **Минимальная маржа для этой монеты: `${suggested_margin} USDT`**"
         )
 
-    # 5. Устанавливаем плечо на OKX
+    # 5. Устанавливаем плечо
     set_okx_leverage(inst_id, max_lev)
 
-    # 6. Расчет целевого объема в контрактах
+    # 6. Расчет целевого объема в контрактах (кратно lot_sz)
     target_notional_usdt = margin_usdt * max_lev
-    contracts_qty = math.floor(target_notional_usdt / (ct_val * last_price))
-
-    # Корректируем согласно шагу lot_sz
-    contracts_qty = int((contracts_qty // lot_sz) * lot_sz)
+    raw_contracts = target_notional_usdt / (ct_val * last_price)
+    contracts_qty = math.floor(raw_contracts / lot_sz) * lot_sz
 
     if contracts_qty < lot_sz:
         suggested_margin = round(min_margin_required + 0.01, 2)
-        return False, (
-            f"❌ Не удалось рассчитать минимальный объем.\n"
-            f"👉 Попробуйте ввести маржу от **${suggested_margin} USDT**."
-        )
+        return False, f"👉 Попробуйте ввести маржу от **${suggested_margin} USDT**."
 
-    formatted_sz = str(contracts_qty)
+    # Корректное форматирование количества контрактов
+    formatted_sz = str(int(contracts_qty)) if lot_sz.is_integer() else f"{contracts_qty:.4f}".rstrip('0').rstrip('.')
+
     actual_notional_usdt = contracts_qty * ct_val * last_price
     actual_margin_used = actual_notional_usdt / max_lev
 
@@ -228,8 +195,7 @@ def calculate_rsi(prices, period=14):
         return 100.0
 
     rs = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return round(rsi, 2)
+    return round(100.0 - (100.0 / (1.0 + rs)), 2)
 
 def get_15m_rsi(inst_id):
     """Получает свечи 15m с OKX и рассчитывает RSI(14)"""
@@ -252,7 +218,6 @@ def close_okx_position(inst_id, pos_side):
 def check_and_close_positions_by_rsi():
     """Фоновая задача: проверяет открытые позиции на закрытии 15m свечи и выводит PnL"""
     try:
-        # Получаем открытые позиции по SWAP
         res = okx_request("GET", "/api/v5/account/positions?instType=SWAP")
         if res.get("code") != "0" or not res.get("data"):
             return
@@ -266,16 +231,13 @@ def check_and_close_positions_by_rsi():
             inst_id = pos.get("instId")
             pos_side = pos.get("posSide")  # "long" или "short"
 
-            # Считываем PnL до закрытия позиции
-            pnl_usdt = float(pos.get("upl", 0.0))  # Unreleased PnL в USDT
-            pnl_ratio = float(pos.get("uplRatio", 0.0)) * 100  # PnL в процентах
+            pnl_usdt = float(pos.get("upl", 0.0))
+            pnl_ratio = float(pos.get("uplRatio", 0.0)) * 100
 
-            # Рассчитываем RSI 15m
             rsi = get_15m_rsi(inst_id)
             if rsi is None:
                 continue
 
-            # Условия закрытия
             should_close = False
             reason = ""
 
@@ -314,7 +276,7 @@ def check_and_close_positions_by_rsi():
 # ================= ПЛАНИРОВЩИК ЗАДАЧ (15m) =================
 
 scheduler = BackgroundScheduler()
-# Запуск каждые 15 минут (в 00, 15, 30, 45 минут каждого часа)
+# Запуск ровно в 00, 15, 30, 45 минут каждого часа
 scheduler.add_job(check_and_close_positions_by_rsi, 'cron', minute='0,15,30,45')
 scheduler.start()
 
@@ -380,9 +342,9 @@ def telegram_callback():
                 success, result_msg = execute_okx_trade(symbol, side_type, margin_usdt)
 
                 if success:
-                    send_telegram_msg(f"✅ **Ордер успешно исполнен!**\n\n{result_msg}")
+                    send_telegram_msg(f"{result_msg}")
                 else:
-                    send_telegram_msg(f"❌ **Ошибка при открытии ордера:**\n`{result_msg}`")
+                    send_telegram_msg(f"❌ **Ошибка при открытии ордера:**\n\n{result_msg}")
             except ValueError:
                 send_telegram_msg("⚠️ Неверный формат! Введи просто число (например: `50` или `100`).")
 
