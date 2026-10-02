@@ -87,6 +87,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
     okx_side = "sell" if side_type == "SHORT" else "buy"
+    pos_side = "short" if side_type == "SHORT" else "long"
 
     # 1. Получаем макс. плечо и рыночную цену
     max_lev, last_price, ct_val = get_max_leverage_and_ticker(inst_id)
@@ -109,6 +110,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         "instId": inst_id,
         "tdMode": "cross",
         "side": okx_side,
+        "posSide": pos_side,
         "ordType": "market",
         "sz": str(sz_contracts)
     }
