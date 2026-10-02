@@ -98,31 +98,81 @@ def set_okx_leverage(inst_id, leverage):
     }
     return okx_request("POST", "/api/v5/account/set-leverage", body)
 
+import math
+
 def execute_okx_trade(symbol, side_type, margin_usdt):
     """
-    Рассчитывает объем позиции в монетах на основе указанной маржи и открывает ордер на SWAP
+    Рассчитывает объем позиции в контрактах (ct) с автоматической проверкой 
+    минимально допустимой маржи в USDT для выбранной монеты.
     """
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
     okx_side = "sell" if side_type == "SHORT" else "buy"
     pos_side = "short" if side_type == "SHORT" else "long"
 
-    # 1. Получаем макс. плечо и текущую рыночную цену
-    max_lev, last_price = get_max_leverage_and_ticker(inst_id)
-    if last_price <= 0:
-        return False, f"Не удалось получить текущую цену для {inst_id} с OKX."
+    max_lev = 20
+    last_price = 0.0
+    ct_val = 1.0   # Количество монет в 1 контракте
+    lot_sz = 1.0   # Минимальный шаг/количество контрактов (обычно 1)
 
-    # 2. Выставляем максимальное плечо
+    try:
+        # 1. Получаем спецификацию инструмента из OKX
+        inst_res = okx_request("GET", f"/api/v5/public/instruments?instType=SWAP&instId={inst_id}")
+        if inst_res.get("code") == "0" and inst_res.get("data"):
+            inst_data = inst_res["data"][0]
+            max_lev = int(inst_data.get("lever", 20))
+            ct_val = float(inst_data.get("ctVal", 1.0))
+            lot_sz = float(inst_data.get("lotSz", 1.0))
+
+        # 2. Получаем текущую рыночную цену
+        ticker_res = okx_request("GET", f"/api/v5/market/ticker?instId={inst_id}")
+        if ticker_res.get("code") == "0" and ticker_res.get("data"):
+            last_price = float(ticker_res["data"][0].get("last", 0.0))
+
+    except Exception as e:
+        print(f"Ошибка получения данных по инструменту {inst_id}: {e}")
+
+    if last_price <= 0:
+        return False, f"Не удалось получить текущую цену для `{inst_id}` с OKX."
+
+    # 3. Расчет стоимости 1 минимального лота (в USDT)
+    min_contract_notional = ct_val * lot_sz * last_price  # Полная стоимость 1 лота без плеча
+    min_margin_required = min_contract_notional / max_lev  # Минимальная маржа с учетом плеча
+
+    # 4. Проверка: достаточно ли введенной маржи
+    if margin_usdt < min_margin_required:
+        # Округляем до 2 знаков с запасом вверх
+        suggested_margin = round(min_margin_required + 0.01, 2)
+        return False, (
+            f"❌ **Суммы ${margin_usdt} недостаточно для входа в {inst_id}!**\n\n"
+            f"• Цена монеты: **${last_price:,.2f}**\n"
+            f"• Максимальное плечо: **{max_lev}x**\n"
+            f"• Стоимость 1 мин. контракта: **${min_contract_notional:.2f}**\n\n"
+            f"👉 **Минимальная маржа для этой монеты: `${suggested_margin} USDT`**"
+        )
+
+    # 5. Устанавливаем плечо на OKX
     set_okx_leverage(inst_id, max_lev)
 
-    # 3. Расчет объёма в USDT (Номинал позиции = Маржа * Плечо)
+    # 6. Расчет целевого объема в контрактах
     target_notional_usdt = margin_usdt * max_lev
+    contracts_qty = math.floor(target_notional_usdt / (ct_val * last_price))
 
-    # 4. Расчет количества монет (Номинал USDT / Текущая цена)
-    coins_qty = target_notional_usdt / last_price
-    formatted_sz = f"{coins_qty:.6f}".rstrip('0').rstrip('.')
+    # Корректируем согласно шагу lot_sz
+    contracts_qty = int((contracts_qty // lot_sz) * lot_sz)
 
-    # 5. Отправка рыночного ордера без tgtCcy (для SWAP)
+    if contracts_qty < lot_sz:
+        suggested_margin = round(min_margin_required + 0.01, 2)
+        return False, (
+            f"❌ Не удалось рассчитать минимальный объем.\n"
+            f"👉 Попробуйте ввести маржу от **${suggested_margin} USDT**."
+        )
+
+    formatted_sz = str(contracts_qty)
+    actual_notional_usdt = contracts_qty * ct_val * last_price
+    actual_margin_used = actual_notional_usdt / max_lev
+
+    # 7. Отправляем ордер
     order_body = {
         "instId": inst_id,
         "tdMode": "cross",
@@ -136,11 +186,13 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
 
     if res.get("code") == "0":
         return True, (
-            f"Инструмент: `{inst_id}`\n"
-            f"Плечо: **{max_lev}x** (Максимальное)\n"
-            f"Введенная маржа: **${margin_usdt}**\n"
-            f"Общий объем позиции: **~${round(target_notional_usdt, 2)}** ({formatted_sz} {clean_symbol})\n"
-            f"ID ордера: `{res['data'][0]['ordId']}`"
+            f"✅ **Ордер успешно открыт!**\n\n"
+            f"• Инструмент: `{inst_id}`\n"
+            f"• Плечо: **{max_lev}x**\n"
+            f"• Контрактов: **{formatted_sz} ct**\n"
+            f"• Задействовано маржи: **~${round(actual_margin_used, 2)} USDT**\n"
+            f"• Общий объем позиции: **~${round(actual_notional_usdt, 2)} USDT**\n"
+            f"• ID ордера: `{res['data'][0]['ordId']}`"
         )
     else:
         msg = res.get("data", [{}])[0].get("sMsg") or res.get("msg")
