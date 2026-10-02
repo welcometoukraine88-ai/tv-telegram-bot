@@ -46,19 +46,26 @@ def okx_request(method, request_path, body_data=None):
     }
 
     url = OKX_BASE_URL + request_path
-    if method == "GET":
-        res = requests.get(url, headers=headers, timeout=10)
-    else:
-        res = requests.post(url, data=body_str, headers=headers, timeout=10)
-    return res.json()
+    try:
+        if method == "GET":
+            res = requests.get(url, headers=headers, timeout=10)
+        else:
+            res = requests.post(url, data=body_str, headers=headers, timeout=10)
+        return res.json()
+    except Exception as e:
+        print(f"Ошибка запроса к OKX ({request_path}): {e}")
+        return {"code": "-1", "msg": str(e)}
 
 def send_telegram_msg(text):
     """Вспомогательная функция отправки сообщения в Telegram"""
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    })
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown"
+        }, timeout=5)
+    except Exception as e:
+        print(f"Ошибка отправки в Telegram: {e}")
 
 def set_okx_leverage(inst_id, leverage):
     """Устанавливает плечо на OKX"""
@@ -87,7 +94,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     lot_sz = 1.0   # Минимальный шаг лота
 
     try:
-        # 1. Запрос параметров инструмента (макс. плечо, размер контракта, шаг лота)
+        # 1. Запрос параметров инструмента
         inst_res = okx_request("GET", f"/api/v5/public/instruments?instType=SWAP&instId={inst_id}")
         if inst_res.get("code") == "0" and inst_res.get("data"):
             inst_data = inst_res["data"][0]
@@ -95,7 +102,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
             ct_val = float(inst_data.get("ctVal", 1.0))
             lot_sz = float(inst_data.get("lotSz", 1.0))
 
-        # 2. Получаем текущую рыночную цену
+        # 2. Получение текущей цены
         ticker_res = okx_request("GET", f"/api/v5/market/ticker?instId={inst_id}")
         if ticker_res.get("code") == "0" and ticker_res.get("data"):
             last_price = float(ticker_res["data"][0].get("last", 0.0))
@@ -121,10 +128,10 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
             f"👉 **Минимальная маржа для этой монеты: `${suggested_margin} USDT`**"
         )
 
-    # 5. Устанавливаем плечо
+    # 5. Установка плеча
     set_okx_leverage(inst_id, max_lev)
 
-    # 6. Расчет целевого объема в контрактах (кратно lot_sz)
+    # 6. Расчет целевого объема
     target_notional_usdt = margin_usdt * max_lev
     raw_contracts = target_notional_usdt / (ct_val * last_price)
     contracts_qty = math.floor(raw_contracts / lot_sz) * lot_sz
@@ -133,13 +140,12 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         suggested_margin = round(min_margin_required + 0.01, 2)
         return False, f"👉 Попробуйте ввести маржу от **${suggested_margin} USDT**."
 
-    # Корректное форматирование количества контрактов
     formatted_sz = str(int(contracts_qty)) if lot_sz.is_integer() else f"{contracts_qty:.4f}".rstrip('0').rstrip('.')
 
     actual_notional_usdt = contracts_qty * ct_val * last_price
     actual_margin_used = actual_notional_usdt / max_lev
 
-    # 7. Отправляем ордер
+    # 7. Отправка ордера
     order_body = {
         "instId": inst_id,
         "tdMode": "cross",
@@ -165,10 +171,10 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         msg = res.get("data", [{}])[0].get("sMsg") or res.get("msg")
         return False, f"Ошибка OKX: {msg}"
 
-# ================= РАСЧЕТ RSI И ЗАКРЫТИЕ ПОЗИЦИЙ С PNL =================
+# ================= РАСЧЕТ RSI И ЗАКРЫТИЕ ПОЗИЦИЙ =================
 
 def calculate_rsi(prices, period=14):
-    """Рассчитывает классический индикатор RSI(14) по массиву цен закрытия"""
+    """Рассчитывает классический индикатор RSI(14)"""
     if len(prices) < period + 1:
         return None
 
@@ -216,7 +222,7 @@ def close_okx_position(inst_id, pos_side):
     return okx_request("POST", "/api/v5/trade/close-position", body)
 
 def check_and_close_positions_by_rsi():
-    """Фоновая задача: проверяет открытые позиции на закрытии 15m свечи и выводит PnL"""
+    """Фоновая задача: проверяет открытые позиции на закрытии 15m свечи"""
     try:
         res = okx_request("GET", "/api/v5/account/positions?instType=SWAP")
         if res.get("code") != "0" or not res.get("data"):
@@ -229,7 +235,7 @@ def check_and_close_positions_by_rsi():
                 continue
 
             inst_id = pos.get("instId")
-            pos_side = pos.get("posSide")  # "long" или "short"
+            pos_side = pos.get("posSide")
 
             pnl_usdt = float(pos.get("upl", 0.0))
             pnl_ratio = float(pos.get("uplRatio", 0.0)) * 100
@@ -276,7 +282,6 @@ def check_and_close_positions_by_rsi():
 # ================= ПЛАНИРОВЩИК ЗАДАЧ (15m) =================
 
 scheduler = BackgroundScheduler()
-# Запуск ровно в 00, 15, 30, 45 минут каждого часа
 scheduler.add_job(check_and_close_positions_by_rsi, 'cron', minute='0,15,30,45')
 scheduler.start()
 
@@ -301,7 +306,10 @@ def send_telegram_signal(symbol, signal_type, raw_text):
         ]
     }
 
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown", "reply_markup": reply_markup})
+    try:
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown", "reply_markup": reply_markup}, timeout=5)
+    except Exception as e:
+        print(f"Ошибка отправки сигнала: {e}")
 
 def parse_alert(text):
     """Парсит алерт от TradingView"""
@@ -357,9 +365,13 @@ def telegram_callback():
 
         if action == "CANCEL":
             PENDING_TRADES.pop(chat_id, None)
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", json={
-                "chat_id": chat_id, "message_id": message_id, "text": "❌ **Сигнал отменён пользователем.**", "parse_mode": "Markdown"
-            })
+            try:
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", json={
+                    "chat_id": chat_id, "message_id": message_id, "text": "❌ **Сигнал отменён пользователем.**", "parse_mode": "Markdown"
+                }, timeout=5)
+            except Exception as e:
+                print(f"Ошибка отмены сигнала: {e}")
+
         elif action.startswith("INIT_"):
             parts = action.split("_")
             side_type = parts[1]
@@ -367,7 +379,11 @@ def telegram_callback():
 
             PENDING_TRADES[chat_id] = {"symbol": symbol, "side_type": side_type}
 
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id})
+            try:
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id}, timeout=5)
+            except Exception as e:
+                print(f"Ошибка CallbackQuery: {e}")
+
             send_telegram_msg(
                 f"💵 **Введи сумму маржи в USDT для входа в {side_type} ({symbol}):**\n\n"
                 f"*(Бот автоматически применит максимально возможное плечо)*"
