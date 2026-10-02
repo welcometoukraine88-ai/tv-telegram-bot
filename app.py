@@ -51,25 +51,22 @@ def okx_request(method, request_path, body_data=None):
     return res.json()
 
 def get_max_leverage_and_ticker(inst_id):
-    """Получает максимальное доступное плечо и текущую цену инструмента"""
+    """Получает максимальное доступное плечо и текущую рыночную цену инструмента"""
     try:
         # 1. Запрос максимального плеча
         lev_res = okx_request("GET", f"/api/v5/public/leverage-lanes?instId={inst_id}&mgnMode=cross")
-        max_lev = "20" # Дефолтное плечо
+        max_lev = 20  # Дефолтное плечо
         if lev_res.get("code") == "0" and lev_res.get("data"):
-            max_lev = str(lev_res["data"][0].get("maxLever", "20"))
+            max_lev = int(lev_res["data"][0].get("maxLever", "20"))
 
-        # 2. Запрос текущей цены и размера контракта (ctVal)
+        # 2. Запрос текущей рыночной цены (last price)
         ticker_res = okx_request("GET", f"/api/v5/market/ticker?instId={inst_id}")
-        price = float(ticker_res["data"][0]["last"]) if ticker_res.get("code") == "0" else 0.0
+        price = float(ticker_res["data"][0]["last"]) if ticker_res.get("code") == "0" and ticker_res.get("data") else 0.0
 
-        instr_res = okx_request("GET", f"/api/v5/public/instruments?instType=SWAP&instId={inst_id}")
-        ct_val = float(instr_res["data"][0]["ctVal"]) if instr_res.get("code") == "0" else 1.0
-
-        return int(max_lev), price, ct_val
+        return max_lev, price
     except Exception as e:
         print(f"Ошибка получения данных тикера: {e}")
-        return 20, 0.0, 1.0
+        return 20, 0.0
 
 def set_okx_leverage(inst_id, leverage):
     """Устанавливает максимальное плечо на OKX"""
@@ -82,47 +79,46 @@ def set_okx_leverage(inst_id, leverage):
 
 def execute_okx_trade(symbol, side_type, margin_usdt):
     """
-    Рассчитывает размер позиции с максимальным плечом и открывает ордер
+    Рассчитывает объем позиции в монетах на основе указанных USDT и открывает ордер (tgtCcy="base")
     """
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
     okx_side = "sell" if side_type == "SHORT" else "buy"
     pos_side = "short" if side_type == "SHORT" else "long"
 
-    # 1. Получаем макс. плечо и рыночную цену
-    max_lev, last_price, ct_val = get_max_leverage_and_ticker(inst_id)
+    # 1. Получаем макс. плечо и текущую рыночную цену
+    max_lev, last_price = get_max_leverage_and_ticker(inst_id)
     if last_price <= 0:
         return False, "Не удалось получить текущую цену монеты с OKX."
 
     # 2. Выставляем максимальное плечо
     set_okx_leverage(inst_id, max_lev)
 
-    # 3. Расчет позиционного объема (Номинал позиции = Маржа * Плечо)
-    notional_usdt = margin_usdt * max_lev
-    
-    # Расчет количества контрактов sz = Номинал / (Цена * Размер_1_контракта)
-    sz_contracts = int(notional_usdt / (last_price * ct_val))
-    if sz_contracts < 1:
-        sz_contracts = 1  # Минимальный размер — 1 контракт
+    # 3. Расчет позиционного объема в USDT (Номинал позиции = Маржа * Плечо)
+    target_notional_usdt = margin_usdt * max_lev
 
-    # 4. Отправка рыночного ордера
+    # 4. Расчет количества монет (Номинал USDT / Текущая цена)
+    coins_qty = target_notional_usdt / last_price
+    formatted_sz = f"{coins_qty:.6f}".rstrip('0').rstrip('.')
+
+    # 5. Отправка рыночного ордера с типом tgtCcy="base"
     order_body = {
         "instId": inst_id,
         "tdMode": "cross",
         "side": okx_side,
         "posSide": pos_side,
         "ordType": "market",
-        "sz": str(sz_contracts)
+        "sz": formatted_sz,
+        "tgtCcy": "base"
     }
 
     res = okx_request("POST", "/api/v5/trade/order", order_body)
 
     if res.get("code") == "0":
-        total_pos_val = round(sz_contracts * last_price * ct_val, 2)
         return True, (
             f"Плечо: **{max_lev}x** (Максимальное)\n"
             f"Введенная маржа: **${margin_usdt}**\n"
-            f"Общий объем позиции: **~${total_pos_val}** ({sz_contracts} контр.)\n"
+            f"Общий объем позиции: **~${round(target_notional_usdt, 2)}** ({formatted_sz} {clean_symbol})\n"
             f"ID ордера: `{res['data'][0]['ordId']}`"
         )
     else:
