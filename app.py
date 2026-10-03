@@ -173,26 +173,29 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
 
 # ================= РАСЧЕТ RSI И ЗАКРЫТИЕ ПОЗИЦИЙ =================
 
-def calculate_rsi(prices, period=14):
-    """Рассчитывает классический индикатор RSI(14)"""
+def calculate_tv_rsi(prices, period=14):
+    """
+    Точный аналог ta.rsi(close, 14) из TradingView (RMA / Wilder's Smoothing).
+    """
     if len(prices) < period + 1:
         return None
 
     gains = []
     losses = []
-
     for i in range(1, len(prices)):
         change = prices[i] - prices[i - 1]
         if change > 0:
             gains.append(change)
             losses.append(0.0)
         else:
-            gains.append(abs(change))
+            gains.append(0.0)
             losses.append(abs(change))
 
+    # Первое значение — SMA за первые period баров
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
+    # Последующие значения — формула RMA (Wilder's Smoothing как на TV)
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
@@ -203,13 +206,24 @@ def calculate_rsi(prices, period=14):
     rs = avg_gain / avg_loss
     return round(100.0 - (100.0 / (1.0 + rs)), 2)
 
+
 def get_15m_rsi(inst_id):
-    """Получает свечи 15m с OKX и рассчитывает RSI(14)"""
-    res = okx_request("GET", f"/api/v5/market/candles?instId={inst_id}&bar=15m&limit=50")
+    """
+    Запрашивает 100 свечей с OKX, отбрасывает незакрытую свечу 
+    и считает RSI строго по закрытым 15m барам.
+    """
+    res = okx_request("GET", f"/api/v5/market/candles?instId={inst_id}&bar=15m&limit=100")
+    
     if res.get("code") == "0" and res.get("data"):
+        # Разворачиваем хронологию (от старых к новым)
         candles = res["data"][::-1]
-        close_prices = [float(c[4]) for c in candles]
-        return calculate_rsi(close_prices, 14)
+        
+        # [:-1] отбрасывает текущую (незакрытую) свечу!
+        closed_candles = candles[:-1] 
+        close_prices = [float(c[4]) for c in closed_candles]
+        
+        return calculate_tv_rsi(close_prices, 14)
+        
     return None
 
 def close_okx_position(inst_id, pos_side):
