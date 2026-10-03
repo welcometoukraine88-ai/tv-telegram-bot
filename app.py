@@ -173,15 +173,14 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
 
 # ================= РАСЧЕТ RSI И ЗАКРЫТИЕ ПОЗИЦИЙ =================
 
-def calculate_tv_rsi(prices, period=14):
-    """
-    Точный аналог ta.rsi(close, 14) из TradingView (RMA / Wilder's Smoothing).
-    """
+def calculate_rsi(prices, period=14):
+    """Классический расчет RSI(14) по массиву цен закрытия"""
     if len(prices) < period + 1:
         return None
 
     gains = []
     losses = []
+
     for i in range(1, len(prices)):
         change = prices[i] - prices[i - 1]
         if change > 0:
@@ -191,11 +190,9 @@ def calculate_tv_rsi(prices, period=14):
             gains.append(0.0)
             losses.append(abs(change))
 
-    # Первое значение — SMA за первые period баров
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    # Последующие значения — формула RMA (Wilder's Smoothing как на TV)
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
@@ -209,20 +206,30 @@ def calculate_tv_rsi(prices, period=14):
 
 def get_15m_rsi(inst_id):
     """
-    Запрашивает 100 свечей с OKX, отбрасывает незакрытую свечу 
-    и считает RSI строго по закрытым 15m барам.
+    Запрашивает 15m свечи с OKX.
+    Гарантированно берёт только ЗАКРЫТЫЕ свечи (отбрасывает текущую не сформированную).
     """
-    res = okx_request("GET", f"/api/v5/market/candles?instId={inst_id}&bar=15m&limit=100")
+    # Запрашиваем 50 свечей с биржи
+    res = okx_request("GET", f"/api/v5/market/candles?instId={inst_id}&bar=15m&limit=50")
     
     if res.get("code") == "0" and res.get("data"):
-        # Разворачиваем хронологию (от старых к новым)
-        candles = res["data"][::-1]
+        raw_candles = res["data"]
         
-        # [:-1] отбрасывает текущую (незакрытую) свечу!
-        closed_candles = candles[:-1] 
+        # Если биржа прислала мало данных — пропускаем
+        if len(raw_candles) < 20:
+            return None
+
+        # В OKX: raw_candles[0] — это ТЕКУЩАЯ незакрытая свеча.
+        # raw_candles[1:] — это ВСЕ УЖЕ ЗАКРЫТЫЕ СВЕЧИ.
+        closed_candles = raw_candles[1:]
+        
+        # Разворачиваем хронологию (чтобы старые свечи были в начале, свежие — в конце)
+        closed_candles = closed_candles[::-1]
+        
+        # Извлекаем цены закрытия (Close price — 4-й индекс)
         close_prices = [float(c[4]) for c in closed_candles]
         
-        return calculate_tv_rsi(close_prices, 14)
+        return calculate_rsi(close_prices, 14)
         
     return None
 
