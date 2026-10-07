@@ -75,17 +75,25 @@ def set_okx_leverage(inst_id, leverage):
     }
     return okx_request("POST", "/api/v5/account/set-leverage", body)
 
-def get_okx_position_side(inst_id):
+def get_okx_position_info(inst_id):
     """
     Проверяет текущую открытую позицию по инструменту на OKX.
-    Возвращает 'long', 'short' или None (если позиции нет).
+    Возвращает словарь с данными позиции (posSide, upl, uplRatio, avgPx, sz) или None.
     """
     res = okx_request("GET", f"/api/v5/account/positions?instType=SWAP&instId={inst_id}")
     if res.get("code") == "0" and res.get("data"):
         for pos in res["data"]:
             pos_qty = float(pos.get("pos", 0))
             if pos_qty != 0:
-                return pos.get("posSide")  # 'long' или 'short'
+                upl = float(pos.get("upl", 0.0))
+                upl_ratio = float(pos.get("uplRatio", 0.0)) * 100
+                return {
+                    "posSide": pos.get("posSide"),
+                    "upl": upl,
+                    "uplRatio": upl_ratio,
+                    "avgPx": pos.get("avgPx"),
+                    "sz": pos.get("pos")
+                }
     return None
 
 def close_okx_position(inst_id, pos_side):
@@ -194,8 +202,8 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
 
 # ================= TELEGRAM & WEBHOOKS =================
 
-def send_telegram_signal(symbol, signal_type, raw_text, is_averaging=False):
-    """Отправляет сигнал на вход или усреднение в Telegram с кнопками"""
+def send_telegram_signal(symbol, signal_type, is_averaging=False):
+    """Отправляет сигнал на вход или добор в Telegram с кнопками"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     emoji = "🔴" if signal_type == "SHORT" else "🟢"
     action_title = "УСРЕДНЕНИЕ (ДОБОР)" if is_averaging else "СИГНАЛ ОТ СТРАТЕГИИ"
@@ -203,13 +211,12 @@ def send_telegram_signal(symbol, signal_type, raw_text, is_averaging=False):
     text = (
         f"{emoji} **{action_title}**\n\n"
         f"Монета: `{symbol}`\n"
-        f"Направление: **{signal_type}**\n\n"
-        f"📝 *Исходный текст:* `{raw_text}`"
+        f"Направление: **{signal_type}**"
     )
 
     reply_markup = {
         "inline_keyboard": [
-            [{"text": f"🚀 Войти / Усреднить ({signal_type})", "callback_data": f"INIT_{signal_type}_{symbol}"}],
+            [{"text": f"🚀 Войти ({signal_type})", "callback_data": f"INIT_{signal_type}_{symbol}"}],
             [{"text": "❌ Пропустить", "callback_data": "CANCEL"}]
         ]
     }
@@ -245,38 +252,53 @@ def webhook():
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
 
-    # Проверяем текущее состояние позиции на OKX
-    current_pos = get_okx_position_side(inst_id)
+    # Проверяем текущую позицию
+    pos_info = get_okx_position_info(inst_id)
+    current_pos = pos_info["posSide"] if pos_info else None
 
     # ЛОГИКА ОБРАБОТКИ СИГНАЛА BUY
     if signal_type == "LONG":
         if current_pos == "short":
             # Закрываем существующий ШОРТ без открытия ЛОНГА
+            upl = pos_info.get("upl", 0.0)
+            upl_ratio = pos_info.get("uplRatio", 0.0)
+
             close_res = close_okx_position(inst_id, "short")
             if close_res.get("code") == "0":
-                send_telegram_msg(f"🔄 **Закрыт SHORT по `{inst_id}`** по сигналу BUY от стратегии.")
+                pnl_sign = "+" if upl >= 0 else ""
+                send_telegram_msg(
+                    f"🔄 **Закрыт SHORT по `{inst_id}`** по сигналу BUY от стратегии.\n"
+                    f"💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`"
+                )
             else:
                 msg = close_res.get("msg") or "Ошибка"
                 send_telegram_msg(f"⚠️ **Ошибка закрытия SHORT по `{inst_id}`:** `{msg}`")
         else:
-            # Если позиции нет или уже открыт LONG — предлагаем войти / усредниться
+            # Если позиции нет или уже открыт LONG — предлагаем войти
             is_avg = (current_pos == "long")
-            send_telegram_signal(symbol, "LONG", raw_data, is_averaging=is_avg)
+            send_telegram_signal(symbol, "LONG", is_averaging=is_avg)
 
     # ЛОГИКА ОБРАБОТКИ СИГНАЛА SELL
     elif signal_type == "SHORT":
         if current_pos == "long":
             # Закрываем существующий ЛОНГ без открытия ШОРТА
+            upl = pos_info.get("upl", 0.0)
+            upl_ratio = pos_info.get("uplRatio", 0.0)
+
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
-                send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}`** по сигналу SELL от стратегии.")
+                pnl_sign = "+" if upl >= 0 else ""
+                send_telegram_msg(
+                    f"🔄 **Закрыт LONG по `{inst_id}`** по сигналу SELL от стратегии.\n"
+                    f"💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`"
+                )
             else:
                 msg = close_res.get("msg") or "Ошибка"
                 send_telegram_msg(f"⚠️ **Ошибка закрытия LONG по `{inst_id}`:** `{msg}`")
         else:
-            # Если позиции нет или уже открыт SHORT — предлагаем войти / усредниться
+            # Если позиции нет или уже открыт SHORT — предлагаем войти
             is_avg = (current_pos == "short")
-            send_telegram_signal(symbol, "SHORT", raw_data, is_averaging=is_avg)
+            send_telegram_signal(symbol, "SHORT", is_averaging=is_avg)
 
     return "OK", 200
 
@@ -335,7 +357,7 @@ def telegram_callback():
                 print(f"Ошибка CallbackQuery: {e}")
 
             send_telegram_msg(
-                f"💵 **Введи сумму маржи в USDT для входа/усреднения в {side_type} ({symbol}):**\n\n"
+                f"💵 **Введи сумму маржи в USDT для входа в {side_type} ({symbol}):**\n\n"
                 f"*(Бот автоматически применит максимально возможное плечо)*"
             )
 
