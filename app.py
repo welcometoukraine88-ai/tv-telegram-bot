@@ -177,30 +177,29 @@ def check_and_close_positions_by_rsi():
             if rsi is None:
                 continue
 
+            upl = pos.get("upl", 0.0)
+            upl_ratio = pos.get("uplRatio", 0.0)
+            pnl_sign = "+" if upl >= 0 else ""
+            pnl_formatted = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+
             # Закрытие LONG при RSI >= 70
             if pos_side == "long" and rsi >= RSI_LONG_EXIT:
                 close_res = close_okx_position(inst_id, "long")
                 if close_res.get("code") == "0":
-                    upl = pos.get("upl", 0.0)
-                    upl_ratio = pos.get("uplRatio", 0.0)
-                    pnl_sign = "+" if upl >= 0 else ""
                     send_telegram_msg(
                         f"🎯 **Авто-закрытие LONG по `{inst_id}`**\n"
-                        f"• Закрытая свеча 15m RSI(14): **{rsi}** (порог $\ge {RSI_LONG_EXIT}$)\n"
-                        f"💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`"
+                        f"• Закрытая свеча 15m RSI(14): **{rsi}** (порог >= {RSI_LONG_EXIT})\n"
+                        f"💰 **PnL:** `{pnl_formatted}`"
                     )
 
             # Закрытие SHORT при RSI <= 30
             elif pos_side == "short" and rsi <= RSI_SHORT_EXIT:
                 close_res = close_okx_position(inst_id, "short")
                 if close_res.get("code") == "0":
-                    upl = pos.get("upl", 0.0)
-                    upl_ratio = pos.get("uplRatio", 0.0)
-                    pnl_sign = "+" if upl >= 0 else ""
                     send_telegram_msg(
                         f"🎯 **Авто-закрытие SHORT по `{inst_id}`**\n"
-                        f"• Закрытая свеча 15m RSI(14): **{rsi}** (порог $\le {RSI_SHORT_EXIT}$)\n"
-                        f"💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`"
+                        f"• Закрытая свеча 15m RSI(14): **{rsi}** (порог <= {RSI_SHORT_EXIT})\n"
+                        f"💰 **PnL:** `{pnl_formatted}`"
                     )
 
     except Exception as e:
