@@ -111,23 +111,16 @@ def close_okx_position(inst_id, pos_side):
 # ================= РАСЧЕТ RSI(14) ПО ЗАКРЫТЫМ СВЕЧАМ =================
 
 def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
-    """
-    Запрашивает свечи с OKX и рассчитывает RSI(14)
-    СТРОГО по полностью сформированным (закрытым) свечам.
-    """
     res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit=50")
     if res.get("code") != "0" or not res.get("data"):
         return None
 
     raw_candles = res["data"]
-    
-    # confirm == "1" означает полностью закрытую свечу
     closed_candles = [c for c in raw_candles if c[8] == "1"]
     
     if len(closed_candles) < 15:
         closed_candles = raw_candles[1:]
 
-    # Хронологический порядок (от старых к новым)
     candles = list(reversed(closed_candles))
     closes = [float(c[4]) for c in candles]
 
@@ -148,7 +141,6 @@ def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
     avg_gain = sum(gains[:14]) / 14.0
     avg_loss = sum(losses[:14]) / 14.0
 
-    # Сглаживание Wilder's Smoothing
     for i in range(14, len(gains)):
         avg_gain = (avg_gain * 13.0 + gains[i]) / 14.0
         avg_loss = (avg_loss * 13.0 + losses[i]) / 14.0
@@ -161,7 +153,6 @@ def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
     return round(rsi, 2)
 
 def check_and_close_positions_by_rsi():
-    """Проверяет открытые позиции и закрывает их по RSI(14)"""
     try:
         positions = get_okx_all_positions()
         if not positions:
@@ -182,7 +173,6 @@ def check_and_close_positions_by_rsi():
             pnl_sign = "+" if upl >= 0 else ""
             pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-            # Закрытие LONG при RSI >= 70
             if pos_side == "long" and rsi >= RSI_LONG_EXIT:
                 close_res = close_okx_position(inst_id, "long")
                 if close_res.get("code") == "0":
@@ -193,7 +183,6 @@ def check_and_close_positions_by_rsi():
                     )
                     send_telegram_msg(msg)
 
-            # Закрытие SHORT при RSI <= 30
             elif pos_side == "short" and rsi <= RSI_SHORT_EXIT:
                 close_res = close_okx_position(inst_id, "short")
                 if close_res.get("code") == "0":
@@ -220,7 +209,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     last_price = 0.0
     ct_val = 1.0
     lot_sz = 1.0
-    tick_sz = 0.01
+    tick_sz_str = "0.01"
 
     try:
         inst_res = okx_request("GET", f"/api/v5/public/instruments?instType=SWAP&instId={inst_id}")
@@ -229,7 +218,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
             max_lev = int(inst_data.get("lever", 20))
             ct_val = float(inst_data.get("ctVal", 1.0))
             lot_sz = float(inst_data.get("lotSz", 1.0))
-            tick_sz = float(inst_data.get("tickSz", 0.01))
+            tick_sz_str = str(inst_data.get("tickSz", "0.01"))
 
         ticker_res = okx_request("GET", f"/api/v5/market/ticker?instId={inst_id}")
         if ticker_res.get("code") == "0" and ticker_res.get("data"):
@@ -241,6 +230,9 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     if last_price <= 0:
         return False, f"Не удалось получить цену для `{inst_id}`."
 
+    # Устанавливаем МАКСИМАЛЬНОЕ плечо монеты на OKX перед ордером
+    set_okx_leverage(inst_id, max_lev)
+
     min_contract_notional = ct_val * lot_sz * last_price
     min_margin_required = min_contract_notional / max_lev
 
@@ -250,8 +242,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
             f"❌ **Недостаточно маржи для {inst_id}!**\n\n"
             f"• Минимальная маржа: `${suggested_margin} USDT`"
         )
-
-    set_okx_leverage(inst_id, max_lev)
 
     target_notional_usdt = margin_usdt * max_lev
     raw_contracts = target_notional_usdt / (ct_val * last_price)
@@ -266,14 +256,25 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     actual_notional_usdt = contracts_qty * ct_val * last_price
     actual_margin_used = actual_notional_usdt / max_lev
 
-    precision = len(str(tick_sz).split('.')[1]) if '.' in str(tick_sz) else 0
+    # РАСЧЕТ ТОЧНОСТИ ЦЕНЫ ДЛЯ СТОП-ЛОССА С УЧЕТОМ TICK_SZ ОКХ
+    tick_sz_float = float(tick_sz_str)
+    if '.' in tick_sz_str:
+        precision = len(tick_sz_str.split('.')[1].rstrip('0'))
+    else:
+        precision = 0
 
     if side_type == "LONG":
-        sl_price = round(last_price * 0.95, precision)
+        raw_sl = last_price * 0.95
     else:
-        sl_price = round(last_price * 1.05, precision)
+        raw_sl = last_price * 1.05
 
-    sl_price_str = f"{sl_price:.{precision}f}" if precision > 0 else str(int(sl_price))
+    # Округление цены до кратности tickSz
+    sl_price = math.floor(raw_sl / tick_sz_float) * tick_sz_float if side_type == "LONG" else math.ceil(raw_sl / tick_sz_float) * tick_sz_float
+
+    if precision > 0:
+        sl_price_str = f"{sl_price:.{precision}f}"
+    else:
+        sl_price_str = str(int(sl_price))
 
     order_body = {
         "instId": inst_id,
@@ -310,7 +311,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
 # ================= TELEGRAM & WEBHOOKS =================
 
 def send_telegram_signal(symbol, signal_type, is_averaging=False):
-    """Отправка сигнала ретеста в Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     emoji = "🔴" if signal_type == "SHORT" else "🟢"
     action_title = "УСРЕДНЕНИЕ (ДОБОР)" if is_averaging else "СИГНАЛ (RETEST)"
@@ -334,7 +334,6 @@ def send_telegram_signal(symbol, signal_type, is_averaging=False):
         print(f"Ошибка отправки сигнала: {e}")
 
 def parse_alert(text):
-    """Парсинг алерта ретеста"""
     symbol = "UNKNOWN"
     signal_type = "UNKNOWN"
 
@@ -379,7 +378,6 @@ def webhook():
     pos_info = next((p for p in positions if p["instId"] == inst_id), None)
     current_pos = pos_info["posSide"] if pos_info else None
 
-    # Buy level retest
     if signal_type == "ENTRY_LONG":
         if current_pos == "short":
             upl = pos_info.get("upl", 0.0)
@@ -397,7 +395,6 @@ def webhook():
         is_avg = (current_pos == "long")
         send_telegram_signal(symbol, "LONG", is_averaging=is_avg)
 
-    # Sell level retest
     elif signal_type == "ENTRY_SHORT":
         if current_pos == "long":
             upl = pos_info.get("upl", 0.0)
