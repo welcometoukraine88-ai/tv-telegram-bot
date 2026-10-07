@@ -267,4 +267,83 @@ def webhook():
     elif signal_type == "SHORT":
         if current_pos == "long":
             # Закрываем существующий ЛОНГ без открытия ШОРТА
-            close_res = close_okx_position(
+            close_res = close_okx_position(inst_id, "long")
+            if close_res.get("code") == "0":
+                send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}`** по сигналу SELL от стратегии.")
+            else:
+                msg = close_res.get("msg") or "Ошибка"
+                send_telegram_msg(f"⚠️ **Ошибка закрытия LONG по `{inst_id}`:** `{msg}`")
+        else:
+            # Если позиции нет или уже открыт SHORT — предлагаем войти / усредниться
+            is_avg = (current_pos == "short")
+            send_telegram_signal(symbol, "SHORT", raw_data, is_averaging=is_avg)
+
+    return "OK", 200
+
+@app.route('/telegram-callback', methods=['POST'])
+def telegram_callback():
+    data = request.get_json()
+
+    if "message" in data and "text" in data["message"]:
+        chat_id = str(data["message"]["chat"]["id"])
+        user_text = data["message"]["text"].strip()
+
+        if chat_id in PENDING_TRADES:
+            try:
+                margin_usdt = float(user_text.replace(",", "."))
+                trade_info = PENDING_TRADES.pop(chat_id)
+                symbol = trade_info["symbol"]
+                side_type = trade_info["side_type"]
+
+                send_telegram_msg(f"⏳ Выставляем макс. плечо и открываем {side_type} по {symbol} на **${margin_usdt}**...")
+
+                success, result_msg = execute_okx_trade(symbol, side_type, margin_usdt)
+
+                if success:
+                    send_telegram_msg(f"{result_msg}")
+                else:
+                    send_telegram_msg(f"❌ **Ошибка при открытии ордера:**\n\n{result_msg}")
+            except ValueError:
+                send_telegram_msg("⚠️ Неверный формат! Введи просто число (например: `50` или `100`).")
+
+    elif "callback_query" in data:
+        query = data["callback_query"]
+        callback_id = query["id"]
+        action = query["data"]
+        message_id = query["message"]["message_id"]
+        chat_id = str(query["message"]["chat"]["id"])
+
+        if action == "CANCEL":
+            PENDING_TRADES.pop(chat_id, None)
+            try:
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", json={
+                    "chat_id": chat_id, "message_id": message_id, "text": "❌ **Сигнал отменён пользователем.**", "parse_mode": "Markdown"
+                }, timeout=5)
+            except Exception as e:
+                print(f"Ошибка отмены сигнала: {e}")
+
+        elif action.startswith("INIT_"):
+            parts = action.split("_")
+            side_type = parts[1]
+            symbol = parts[2]
+
+            PENDING_TRADES[chat_id] = {"symbol": symbol, "side_type": side_type}
+
+            try:
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id}, timeout=5)
+            except Exception as e:
+                print(f"Ошибка CallbackQuery: {e}")
+
+            send_telegram_msg(
+                f"💵 **Введи сумму маржи в USDT для входа/усреднения в {side_type} ({symbol}):**\n\n"
+                f"*(Бот автоматически применит максимально возможное плечо)*"
+            )
+
+    return "OK", 200
+
+@app.route('/', methods=['GET'])
+def index():
+    return "OKX Bot is Running!", 200
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
