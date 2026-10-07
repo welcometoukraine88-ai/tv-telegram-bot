@@ -8,7 +8,6 @@ import hmac
 import hashlib
 from flask import Flask, request
 import requests
-from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
@@ -75,6 +74,28 @@ def set_okx_leverage(inst_id, leverage):
         "mgnMode": "cross"
     }
     return okx_request("POST", "/api/v5/account/set-leverage", body)
+
+def get_okx_position_side(inst_id):
+    """
+    Проверяет текущую открытую позицию по инструменту на OKX.
+    Возвращает 'long', 'short' или None (если позиции нет).
+    """
+    res = okx_request("GET", f"/api/v5/account/positions?instType=SWAP&instId={inst_id}")
+    if res.get("code") == "0" and res.get("data"):
+        for pos in res["data"]:
+            pos_qty = float(pos.get("pos", 0))
+            if pos_qty != 0:
+                return pos.get("posSide")  # 'long' или 'short'
+    return None
+
+def close_okx_position(inst_id, pos_side):
+    """Полностью закрывает позицию по рынку (Market Close)"""
+    body = {
+        "instId": inst_id,
+        "mgnMode": "cross",
+        "posSide": pos_side
+    }
+    return okx_request("POST", "/api/v5/trade/close-position", body)
 
 # ================= РАСЧЕТ И ИСПОЛНЕНИЕ ОРДЕРА В КОНТРАКТАХ =================
 
@@ -171,158 +192,24 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         msg = res.get("data", [{}])[0].get("sMsg") or res.get("msg")
         return False, f"Ошибка OKX: {msg}"
 
-# ================= РАСЧЕТ RSI И ЗАКРЫТИЕ ПОЗИЦИЙ =================
-
-def calculate_rsi(prices, period=14):
-    """Классический расчет RSI(14) по массиву цен закрытия"""
-    if len(prices) < period + 1:
-        return None
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(prices)):
-        change = prices[i] - prices[i - 1]
-        if change > 0:
-            gains.append(change)
-            losses.append(0.0)
-        else:
-            gains.append(0.0)
-            losses.append(abs(change))
-
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-
-    if avg_loss == 0:
-        return 100.0
-
-    rs = avg_gain / avg_loss
-    return round(100.0 - (100.0 / (1.0 + rs)), 2)
-
-
-def get_15m_rsi(inst_id):
-    """
-    Запрашивает 15m свечи с OKX.
-    Гарантированно берёт только ЗАКРЫТЫЕ свечи (отбрасывает текущую не сформированную).
-    """
-    # Запрашиваем 50 свечей с биржи
-    res = okx_request("GET", f"/api/v5/market/candles?instId={inst_id}&bar=15m&limit=50")
-    
-    if res.get("code") == "0" and res.get("data"):
-        raw_candles = res["data"]
-        
-        # Если биржа прислала мало данных — пропускаем
-        if len(raw_candles) < 20:
-            return None
-
-        # В OKX: raw_candles[0] — это ТЕКУЩАЯ незакрытая свеча.
-        # raw_candles[1:] — это ВСЕ УЖЕ ЗАКРЫТЫЕ СВЕЧИ.
-        closed_candles = raw_candles[1:]
-        
-        # Разворачиваем хронологию (чтобы старые свечи были в начале, свежие — в конце)
-        closed_candles = closed_candles[::-1]
-        
-        # Извлекаем цены закрытия (Close price — 4-й индекс)
-        close_prices = [float(c[4]) for c in closed_candles]
-        
-        return calculate_rsi(close_prices, 14)
-        
-    return None
-
-def close_okx_position(inst_id, pos_side):
-    """Полностью закрывает позицию по рынку (Market Close)"""
-    body = {
-        "instId": inst_id,
-        "mgnMode": "cross",
-        "posSide": pos_side
-    }
-    return okx_request("POST", "/api/v5/trade/close-position", body)
-
-def check_and_close_positions_by_rsi():
-    """Фоновая задача: проверяет открытые позиции на закрытии 15m свечи"""
-    try:
-        res = okx_request("GET", "/api/v5/account/positions?instType=SWAP")
-        if res.get("code") != "0" or not res.get("data"):
-            return
-
-        positions = res["data"]
-        for pos in positions:
-            pos_qty = float(pos.get("pos", 0))
-            if pos_qty == 0:
-                continue
-
-            inst_id = pos.get("instId")
-            pos_side = pos.get("posSide")
-
-            pnl_usdt = float(pos.get("upl", 0.0))
-            pnl_ratio = float(pos.get("uplRatio", 0.0)) * 100
-
-            rsi = get_15m_rsi(inst_id)
-            if rsi is None:
-                continue
-
-            should_close = False
-            reason = ""
-
-            if pos_side == "long" and rsi >= 70:
-                should_close = True
-                reason = f"RSI(15m) = **{rsi}** (≥ 70 — Перекупленность)"
-            elif pos_side == "short" and rsi <= 30:
-                should_close = True
-                reason = f"RSI(15m) = **{rsi}** (≤ 30 — Перепроданность)"
-
-            if should_close:
-                close_res = close_okx_position(inst_id, pos_side)
-                if close_res.get("code") == "0":
-                    pnl_emoji = "🟩" if pnl_usdt >= 0 else "🟥"
-                    pnl_str = f"+${pnl_usdt:.2f}" if pnl_usdt >= 0 else f"-${abs(pnl_usdt):.2f}"
-                    pnl_ratio_str = f"+{pnl_ratio:.2f}%" if pnl_ratio >= 0 else f"{pnl_ratio:.2f}%"
-
-                    send_telegram_msg(
-                        f"🚨 **АВТО-ЗАКРЫТИЕ ПОЗИЦИИ BY RSI**\n\n"
-                        f"Монета: `{inst_id}`\n"
-                        f"Позиция: **{pos_side.upper()}**\n"
-                        f"Причина: {reason}\n\n"
-                        f"📊 **РЕЗУЛЬТАТ СДЕЛКИ:**\n"
-                        f"PnL (USDT): {pnl_emoji} **{pnl_str}**\n"
-                        f"PnL (%): {pnl_emoji} **{pnl_ratio_str}**\n\n"
-                        f"Статус: ✅ **Позиция закрыта**"
-                    )
-                else:
-                    err_msg = close_res.get("msg") or "Ошибка закрытия"
-                    send_telegram_msg(
-                        f"⚠️ **Ошибка закрытия позиции `{inst_id}` ({pos_side}):** `{err_msg}`"
-                    )
-    except Exception as e:
-        print(f"Ошибка при проверке RSI позиций: {e}")
-
-# ================= ПЛАНИРОВЩИК ЗАДАЧ (15m) =================
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(check_and_close_positions_by_rsi, 'cron', minute='0,15,30,45')
-scheduler.start()
-
 # ================= TELEGRAM & WEBHOOKS =================
 
-def send_telegram_signal(symbol, signal_type, raw_text):
-    """Отправляет сигнал в Telegram с кнопками"""
+def send_telegram_signal(symbol, signal_type, raw_text, is_averaging=False):
+    """Отправляет сигнал на вход или усреднение в Telegram с кнопками"""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     emoji = "🔴" if signal_type == "SHORT" else "🟢"
+    action_title = "УСРЕДНЕНИЕ (ДОБОР)" if is_averaging else "СИГНАЛ ОТ СТРАТЕГИИ"
 
     text = (
-        f"{emoji} **СИГНАЛ ОТ ИНДИКАТОРА**\n\n"
+        f"{emoji} **{action_title}**\n\n"
         f"Монета: `{symbol}`\n"
-        f"Тип: **{signal_type}**\n\n"
+        f"Направление: **{signal_type}**\n\n"
         f"📝 *Исходный текст:* `{raw_text}`"
     )
 
     reply_markup = {
         "inline_keyboard": [
-            [{"text": f"🚀 Войти в {signal_type}", "callback_data": f"INIT_{signal_type}_{symbol}"}],
+            [{"text": f"🚀 Войти / Усреднить ({signal_type})", "callback_data": f"INIT_{signal_type}_{symbol}"}],
             [{"text": "❌ Пропустить", "callback_data": "CANCEL"}]
         ]
     }
@@ -333,88 +220,51 @@ def send_telegram_signal(symbol, signal_type, raw_text):
         print(f"Ошибка отправки сигнала: {e}")
 
 def parse_alert(text):
-    """Парсит алерт от TradingView"""
+    """Парсит алерт от стратегии TradingView (ищет тикер и buy/sell)"""
     match = re.search(r'([A-Z0-9]+USDT(?:\.P)?)', text)
     symbol = match.group(1) if match else "UNKNOWN"
+    
     signal_type = "UNKNOWN"
-    if "upthrust" in text.lower() or "short" in text.lower():
+    text_lower = text.lower()
+    
+    if "sell" in text_lower:
         signal_type = "SHORT"
-    elif "spring" in text.lower() or "long" in text.lower():
+    elif "buy" in text_lower:
         signal_type = "LONG"
+        
     return symbol, signal_type
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     raw_data = request.get_data(as_text=True)
     symbol, signal_type = parse_alert(raw_data)
-    if signal_type in ["SHORT", "LONG"]:
-        send_telegram_signal(symbol, signal_type, raw_data)
-    return "OK", 200
+    
+    if symbol == "UNKNOWN" or signal_type == "UNKNOWN":
+        return "Ignored", 200
 
-@app.route('/telegram-callback', methods=['POST'])
-def telegram_callback():
-    data = request.get_json()
+    clean_symbol = symbol.replace(".P", "").replace("USDT", "")
+    inst_id = f"{clean_symbol}-USDT-SWAP"
 
-    if "message" in data and "text" in data["message"]:
-        chat_id = str(data["message"]["chat"]["id"])
-        user_text = data["message"]["text"].strip()
+    # Проверяем текущее состояние позиции на OKX
+    current_pos = get_okx_position_side(inst_id)
 
-        if chat_id in PENDING_TRADES:
-            try:
-                margin_usdt = float(user_text.replace(",", "."))
-                trade_info = PENDING_TRADES.pop(chat_id)
-                symbol = trade_info["symbol"]
-                side_type = trade_info["side_type"]
+    # ЛОГИКА ОБРАБОТКИ СИГНАЛА BUY
+    if signal_type == "LONG":
+        if current_pos == "short":
+            # Закрываем существующий ШОРТ без открытия ЛОНГА
+            close_res = close_okx_position(inst_id, "short")
+            if close_res.get("code") == "0":
+                send_telegram_msg(f"🔄 **Закрыт SHORT по `{inst_id}`** по сигналу BUY от стратегии.")
+            else:
+                msg = close_res.get("msg") or "Ошибка"
+                send_telegram_msg(f"⚠️ **Ошибка закрытия SHORT по `{inst_id}`:** `{msg}`")
+        else:
+            # Если позиции нет или уже открыт LONG — предлагаем войти / усредниться
+            is_avg = (current_pos == "long")
+            send_telegram_signal(symbol, "LONG", raw_data, is_averaging=is_avg)
 
-                send_telegram_msg(f"⏳ Выставляем макс. плечо и открываем {side_type} по {symbol} на **${margin_usdt}**...")
-
-                success, result_msg = execute_okx_trade(symbol, side_type, margin_usdt)
-
-                if success:
-                    send_telegram_msg(f"{result_msg}")
-                else:
-                    send_telegram_msg(f"❌ **Ошибка при открытии ордера:**\n\n{result_msg}")
-            except ValueError:
-                send_telegram_msg("⚠️ Неверный формат! Введи просто число (например: `50` или `100`).")
-
-    elif "callback_query" in data:
-        query = data["callback_query"]
-        callback_id = query["id"]
-        action = query["data"]
-        message_id = query["message"]["message_id"]
-        chat_id = str(query["message"]["chat"]["id"])
-
-        if action == "CANCEL":
-            PENDING_TRADES.pop(chat_id, None)
-            try:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", json={
-                    "chat_id": chat_id, "message_id": message_id, "text": "❌ **Сигнал отменён пользователем.**", "parse_mode": "Markdown"
-                }, timeout=5)
-            except Exception as e:
-                print(f"Ошибка отмены сигнала: {e}")
-
-        elif action.startswith("INIT_"):
-            parts = action.split("_")
-            side_type = parts[1]
-            symbol = parts[2]
-
-            PENDING_TRADES[chat_id] = {"symbol": symbol, "side_type": side_type}
-
-            try:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id}, timeout=5)
-            except Exception as e:
-                print(f"Ошибка CallbackQuery: {e}")
-
-            send_telegram_msg(
-                f"💵 **Введи сумму маржи в USDT для входа в {side_type} ({symbol}):**\n\n"
-                f"*(Бот автоматически применит максимально возможное плечо)*"
-            )
-
-    return "OK", 200
-
-@app.route('/', methods=['GET'])
-def index():
-    return "OKX Bot is Running!", 200
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    # ЛОГИКА ОБРАБОТКИ СИГНАЛА SELL
+    elif signal_type == "SHORT":
+        if current_pos == "long":
+            # Закрываем существующий ЛОНГ без открытия ШОРТА
+            close_res = close_okx_position(
