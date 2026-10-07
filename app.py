@@ -180,27 +180,29 @@ def check_and_close_positions_by_rsi():
             upl = pos.get("upl", 0.0)
             upl_ratio = pos.get("uplRatio", 0.0)
             pnl_sign = "+" if upl >= 0 else ""
-            pnl_formatted = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+            pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
             # Закрытие LONG при RSI >= 70
             if pos_side == "long" and rsi >= RSI_LONG_EXIT:
                 close_res = close_okx_position(inst_id, "long")
                 if close_res.get("code") == "0":
-                    send_telegram_msg(
+                    msg = (
                         f"🎯 **Авто-закрытие LONG по `{inst_id}`**\n"
                         f"• Закрытая свеча 15m RSI(14): **{rsi}** (порог >= {RSI_LONG_EXIT})\n"
-                        f"💰 **PnL:** `{pnl_formatted}`"
+                        f"💰 **PnL:** `{pnl_str}`"
                     )
+                    send_telegram_msg(msg)
 
             # Закрытие SHORT при RSI <= 30
             elif pos_side == "short" and rsi <= RSI_SHORT_EXIT:
                 close_res = close_okx_position(inst_id, "short")
                 if close_res.get("code") == "0":
-                    send_telegram_msg(
+                    msg = (
                         f"🎯 **Авто-закрытие SHORT по `{inst_id}`**\n"
                         f"• Закрытая свеча 15m RSI(14): **{rsi}** (порог <= {RSI_SHORT_EXIT})\n"
-                        f"💰 **PnL:** `{pnl_formatted}`"
+                        f"💰 **PnL:** `{pnl_str}`"
                     )
+                    send_telegram_msg(msg)
 
     except Exception as e:
         print(f"Ошибка проверки RSI: {e}")
@@ -246,7 +248,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         suggested_margin = round(min_margin_required + 0.01, 2)
         return False, (
             f"❌ **Недостаточно маржи для {inst_id}!**\n\n"
-            f"• Минимальная маржа: `${suggested_margin} USDT`**"
+            f"• Минимальная маржа: `${suggested_margin} USDT`"
         )
 
     set_okx_leverage(inst_id, max_lev)
@@ -385,6 +387,104 @@ def webhook():
             close_res = close_okx_position(inst_id, "short")
             if close_res.get("code") == "0":
                 pnl_sign = "+" if upl >= 0 else ""
-                send_telegram_msg(
+                pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+                msg = (
                     f"🔄 **Закрыт SHORT по `{inst_id}`** (получен противоположный Buy level retest).\n"
-                    f"💰 **PnL:** `{pnl_sign
+                    f"💰 **PnL:** `{pnl_str}`"
+                )
+                send_telegram_msg(msg)
+
+        is_avg = (current_pos == "long")
+        send_telegram_signal(symbol, "LONG", is_averaging=is_avg)
+
+    # Sell level retest
+    elif signal_type == "ENTRY_SHORT":
+        if current_pos == "long":
+            upl = pos_info.get("upl", 0.0)
+            upl_ratio = pos_info.get("uplRatio", 0.0)
+            close_res = close_okx_position(inst_id, "long")
+            if close_res.get("code") == "0":
+                pnl_sign = "+" if upl >= 0 else ""
+                pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+                msg = (
+                    f"🔄 **Закрыт LONG по `{inst_id}`** (получен противоположный Sell level retest).\n"
+                    f"💰 **PnL:** `{pnl_str}`"
+                )
+                send_telegram_msg(msg)
+
+        is_avg = (current_pos == "short")
+        send_telegram_signal(symbol, "SHORT", is_averaging=is_avg)
+
+    return "OK", 200
+
+@app.route('/telegram-callback', methods=['POST'])
+def telegram_callback():
+    data = request.get_json()
+
+    if "message" in data and "text" in data["message"]:
+        chat_id = str(data["message"]["chat"]["id"])
+        user_text = data["message"]["text"].strip()
+
+        if chat_id in PENDING_TRADES:
+            try:
+                margin_usdt = float(user_text.replace(",", "."))
+                trade_info = PENDING_TRADES.pop(chat_id)
+                symbol = trade_info["symbol"]
+                side_type = trade_info["side_type"]
+
+                send_telegram_msg(f"⏳ Открываем {side_type} по {symbol} на **${margin_usdt}**...")
+                success, result_msg = execute_okx_trade(symbol, side_type, margin_usdt)
+                send_telegram_msg(result_msg)
+
+            except ValueError:
+                send_telegram_msg("⚠️ Введите число (например: `50` или `100`).")
+
+    elif "callback_query" in data:
+        query = data["callback_query"]
+        callback_id = query["id"]
+        action = query["data"]
+        message_id = query["message"]["message_id"]
+        chat_id = str(query["message"]["chat"]["id"])
+
+        if action == "CANCEL":
+            PENDING_TRADES.pop(chat_id, None)
+            try:
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", json={
+                    "chat_id": chat_id, "message_id": message_id, "text": "❌ **Сигнал отменён.**", "parse_mode": "Markdown"
+                }, timeout=5)
+            except Exception as e:
+                print(f"Ошибка отмены: {e}")
+
+        elif action.startswith("INIT_"):
+            parts = action.split("_")
+            side_type = parts[1]
+            symbol = parts[2]
+
+            PENDING_TRADES[chat_id] = {"symbol": symbol, "side_type": side_type}
+
+            try:
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id}, timeout=5)
+            except Exception as e:
+                print(f"Ошибка Callback: {e}")
+
+            send_telegram_msg(f"💵 **Введи сумму маржи в USDT для входа в {side_type} ({symbol}):**")
+
+    return "OK", 200
+
+@app.route('/', methods=['GET'])
+def index():
+    return "OKX Signal Bot is Running!", 200
+
+# ИНИЦИАЛИЗАЦИЯ ПЛАНИРОВЩИКА СТРОГО ПО 15M СВЕЧАМ
+scheduler = BackgroundScheduler(daemon=True)
+scheduler.add_job(
+    func=check_and_close_positions_by_rsi,
+    trigger='cron',
+    minute='0,15,30,45',
+    second='3',
+    id='rsi_checker_job'
+)
+scheduler.start()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
