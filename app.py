@@ -111,21 +111,29 @@ def close_okx_position(inst_id, pos_side):
 # ================= РАСЧЕТ RSI(14) ПО ЗАКРЫТЫМ СВЕЧАМ =================
 
 def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
-    res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit=50")
+    # Запрашиваем с запасом (например, 100 свечей), чтобы сглаживание Уайлдера успело стабилизироваться
+    res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit=100")
     if res.get("code") != "0" or not res.get("data"):
         return None
 
     raw_candles = res["data"]
+    
+    # OKX возвращает свечи от новых к старым. 
+    # Исключаем самую первую свечу [0], если она еще не закрыта, либо берем только полностью закрытые.
+    # В OKX массив свечи: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+    # confirm == "1" означает, что свеча закрыта.
     closed_candles = [c for c in raw_candles if c[8] == "1"]
     
-    if len(closed_candles) < 15:
+    if len(closed_candles) < 30:
+        # Если по какой-то причине флаг confirm не отработал, берем просто со второй свечи (пропуская текущую незакрытую)
         closed_candles = raw_candles[1:]
 
+    if len(closed_candles) < 20:
+        return None
+
+    # Разворачиваем в хронологическом порядке: от старых к новым
     candles = list(reversed(closed_candles))
     closes = [float(c[4]) for c in candles]
-
-    if len(closes) < 15:
-        return None
 
     gains = []
     losses = []
@@ -135,18 +143,25 @@ def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
             gains.append(diff)
             losses.append(0.0)
         else:
-            gains.append(abs(diff))
+            gains.append(0.0)
             losses.append(abs(diff))
 
+    if len(gains) < 14:
+        return None
+
+    # Первые 14 периодов — простое среднее (SMA) для инициализации по методу Уайлдера
     avg_gain = sum(gains[:14]) / 14.0
     avg_loss = sum(losses[:14]) / 14.0
 
+    # Дальнейший расчет по формуле Уайлдера (Wilder's Smoothing)
     for i in range(14, len(gains)):
         avg_gain = (avg_gain * 13.0 + gains[i]) / 14.0
         avg_loss = (avg_loss * 13.0 + losses[i]) / 14.0
 
     if avg_loss == 0:
         return 100.0
+    if avg_gain == 0:
+        return 0.0
 
     rs = avg_gain / avg_loss
     rsi = 100.0 - (100.0 / (1.0 + rs))
