@@ -509,4 +509,28 @@ def telegram_callback():
             PENDING_TRADES[chat_id] = {"symbol": symbol, "side_type": side_type}
 
             try:
-                requests.post(f"
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id}, timeout=5)
+            except Exception as e:
+                print(f"Ошибка Callback: {e}")
+
+            send_telegram_msg(f"💵 **Введи сумму маржи в USDT для входа в {side_type} ({symbol}):**")
+
+    return "OK", 200
+
+@app.route('/', methods=['GET'])
+def index():
+    return "OKX Signal Bot (Wyckoff + RSI) is Running!", 200
+
+# ИНИЦИАЛИЗАЦИЯ ПЛАНИРОВЩИКА СТРОГО ПО 15M СВЕЧАМ
+scheduler = BackgroundScheduler(daemon=True)
+scheduler.add_job(
+    func=check_and_close_positions_by_rsi,
+    trigger='cron',
+    minute='0,15,30,45',
+    second='3',
+    id='rsi_checker_job'
+)
+scheduler.start()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
