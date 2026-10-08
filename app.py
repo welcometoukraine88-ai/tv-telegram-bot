@@ -236,7 +236,7 @@ def check_and_close_positions_by_rsi():
 # ================= РАСЧЕТ И ИСПОЛНЕНИЕ ОРДЕРА =================
 
 def execute_okx_trade(symbol, side_type, margin_usdt):
-    """Открывает сделку с максимальным плечом и 5% стоп-лоссом"""
+    """Открывает сделку с максимальным плечом (без фиксированного стоп-лосса)"""
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
     okx_side = "sell" if side_type == "SHORT" else "buy"
@@ -246,7 +246,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     last_price = 0.0
     ct_val = 1.0
     lot_sz = 1.0
-    tick_sz_str = "0.01"
 
     try:
         inst_res = okx_request("GET", f"/api/v5/public/instruments?instType=SWAP&instId={inst_id}")
@@ -255,7 +254,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
             max_lev = int(inst_data.get("lever", 20))
             ct_val = float(inst_data.get("ctVal", 1.0))
             lot_sz = float(inst_data.get("lotSz", 1.0))
-            tick_sz_str = str(inst_data.get("tickSz", "0.01"))
 
         ticker_res = okx_request("GET", f"/api/v5/market/ticker?instId={inst_id}")
         if ticker_res.get("code") == "0" and ticker_res.get("data"):
@@ -292,38 +290,14 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     actual_notional_usdt = contracts_qty * ct_val * last_price
     actual_margin_used = actual_notional_usdt / max_lev
 
-    tick_sz_float = float(tick_sz_str)
-    if '.' in tick_sz_str:
-        precision = len(tick_sz_str.split('.')[1].rstrip('0'))
-    else:
-        precision = 0
-
-    if side_type == "LONG":
-        raw_sl = last_price * 0.95
-    else:
-        raw_sl = last_price * 1.05
-
-    sl_price = math.floor(raw_sl / tick_sz_float) * tick_sz_float if side_type == "LONG" else math.ceil(raw_sl / tick_sz_float) * tick_sz_float
-
-    if precision > 0:
-        sl_price_str = f"{sl_price:.{precision}f}"
-    else:
-        sl_price_str = str(int(sl_price))
-
+    # Рыночный ордер без прикреплённых алго-ордеров стоп-лосса
     order_body = {
         "instId": inst_id,
         "tdMode": "cross",
         "side": okx_side,
         "posSide": pos_side,
         "ordType": "market",
-        "sz": formatted_sz,
-        "attachAlgoOrds": [
-            {
-                "slTriggerPx": sl_price_str,
-                "slOrdPx": "-1",
-                "slTriggerPxType": "last"
-            }
-        ]
+        "sz": formatted_sz
     }
 
     res = okx_request("POST", "/api/v5/trade/order", order_body)
@@ -335,8 +309,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
             f"• Направление: **{side_type}**\n"
             f"• Плечо: **{max_lev}x**\n"
             f"• Маржа: **~${round(actual_margin_used, 2)} USDT**\n"
-            f"• Объем: **~${round(actual_notional_usdt, 2)} USDT**\n"
-            f"• 🛑 **Стоп-лосс (5%): `${sl_price_str}`**"
+            f"• Объем: **~${round(actual_notional_usdt, 2)} USDT**"
         )
     else:
         msg = res.get("data", [{}])[0].get("sMsg") or res.get("msg")
@@ -536,28 +509,4 @@ def telegram_callback():
             PENDING_TRADES[chat_id] = {"symbol": symbol, "side_type": side_type}
 
             try:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": callback_id}, timeout=5)
-            except Exception as e:
-                print(f"Ошибка Callback: {e}")
-
-            send_telegram_msg(f"💵 **Введи сумму маржи в USDT для входа в {side_type} ({symbol}):**")
-
-    return "OK", 200
-
-@app.route('/', methods=['GET'])
-def index():
-    return "OKX Signal Bot (Wyckoff + RSI) is Running!", 200
-
-# ИНИЦИАЛИЗАЦИЯ ПЛАНИРОВЩИКА СТРОГО ПО 15M СВЕЧАМ
-scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(
-    func=check_and_close_positions_by_rsi,
-    trigger='cron',
-    minute='0,15,30,45',
-    second='3',
-    id='rsi_checker_job'
-)
-scheduler.start()
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+                requests.post(f"
