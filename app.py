@@ -22,10 +22,13 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 
 OKX_BASE_URL = "https://www.okx.com"
 
-# НАСТРОЙКИ ВЫХОДА ПО RSI(14)
-RSI_TIMEFRAME = "15m"      # Таймфрейм свечей
-RSI_LONG_EXIT = 70.0       # Закрывать LONG, если RSI >= 70
-RSI_SHORT_EXIT = 30.0      # Закрывать SHORT, если RSI <= 30
+# НАСТРОЙКИ ВЫХОДА И ИНВАЛИДАЦИИ ПО RSI(14)
+RSI_TIMEFRAME = "15m"       # Таймфрейм свечей
+RSI_LONG_EXIT = 70.0       # Тейк-профит LONG (RSI >= 70)
+RSI_LONG_INVALID = 30.0     # Инвалидация LONG (RSI <= 30)
+
+RSI_SHORT_EXIT = 30.0      # Тейк-профит SHORT (RSI <= 30)
+RSI_SHORT_INVALID = 70.0    # Инвалидация SHORT (RSI >= 70)
 
 # Временное хранилище ожидания ввода маржи (в памяти)
 PENDING_TRADES = {}
@@ -111,27 +114,19 @@ def close_okx_position(inst_id, pos_side):
 # ================= РАСЧЕТ RSI(14) ПО ЗАКРЫТЫМ СВЕЧАМ =================
 
 def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
-    # Запрашиваем с запасом (например, 100 свечей), чтобы сглаживание Уайлдера успело стабилизироваться
     res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit=100")
     if res.get("code") != "0" or not res.get("data"):
         return None
 
     raw_candles = res["data"]
-    
-    # OKX возвращает свечи от новых к старым. 
-    # Исключаем самую первую свечу [0], если она еще не закрыта, либо берем только полностью закрытые.
-    # В OKX массив свечи: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
-    # confirm == "1" означает, что свеча закрыта.
     closed_candles = [c for c in raw_candles if c[8] == "1"]
-    
+
     if len(closed_candles) < 30:
-        # Если по какой-то причине флаг confirm не отработал, берем просто со второй свечи (пропуская текущую незакрытую)
         closed_candles = raw_candles[1:]
 
     if len(closed_candles) < 20:
         return None
 
-    # Разворачиваем в хронологическом порядке: от старых к новым
     candles = list(reversed(closed_candles))
     closes = [float(c[4]) for c in candles]
 
@@ -149,11 +144,9 @@ def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
     if len(gains) < 14:
         return None
 
-    # Первые 14 периодов — простое среднее (SMA) для инициализации по методу Уайлдера
     avg_gain = sum(gains[:14]) / 14.0
     avg_loss = sum(losses[:14]) / 14.0
 
-    # Дальнейший расчет по формуле Уайлдера (Wilder's Smoothing)
     for i in range(14, len(gains)):
         avg_gain = (avg_gain * 13.0 + gains[i]) / 14.0
         avg_loss = (avg_loss * 13.0 + losses[i]) / 14.0
@@ -168,6 +161,7 @@ def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
     return round(rsi, 2)
 
 def check_and_close_positions_by_rsi():
+    """Проверка RSI на 15m свече: выход по профиту или инвалидация сделки"""
     try:
         positions = get_okx_all_positions()
         if not positions:
@@ -188,25 +182,53 @@ def check_and_close_positions_by_rsi():
             pnl_sign = "+" if upl >= 0 else ""
             pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-            if pos_side == "long" and rsi >= RSI_LONG_EXIT:
-                close_res = close_okx_position(inst_id, "long")
-                if close_res.get("code") == "0":
-                    msg = (
-                        f"🎯 **Авто-закрытие LONG по `{inst_id}`**\n"
-                        f"• Закрытая свеча 15m RSI(14): **{rsi}** (порог >= {RSI_LONG_EXIT})\n"
-                        f"💰 **PnL:** `{pnl_str}`"
-                    )
-                    send_telegram_msg(msg)
+            # 1. ПРОВЕРКА LONG
+            if pos_side == "long":
+                # Тейк-профит exit
+                if rsi >= RSI_LONG_EXIT:
+                    close_res = close_okx_position(inst_id, "long")
+                    if close_res.get("code") == "0":
+                        msg = (
+                            f"🎯 **Тейк-профит LONG по `{inst_id}`**\n"
+                            f"• Закрытая свеча 15m RSI(14): **{rsi}** (порог >= {RSI_LONG_EXIT})\n"
+                            f"💰 **PnL:** `{pnl_str}`"
+                        )
+                        send_telegram_msg(msg)
 
-            elif pos_side == "short" and rsi <= RSI_SHORT_EXIT:
-                close_res = close_okx_position(inst_id, "short")
-                if close_res.get("code") == "0":
-                    msg = (
-                        f"🎯 **Авто-закрытие SHORT по `{inst_id}`**\n"
-                        f"• Закрытая свеча 15m RSI(14): **{rsi}** (порог <= {RSI_SHORT_EXIT})\n"
-                        f"💰 **PnL:** `{pnl_str}`"
-                    )
-                    send_telegram_msg(msg)
+                # Инвалидация сделки
+                elif rsi <= RSI_LONG_INVALID:
+                    close_res = close_okx_position(inst_id, "long")
+                    if close_res.get("code") == "0":
+                        msg = (
+                            f"🚨 **ИНВАЛИДАЦИЯ LONG по `{inst_id}`**\n"
+                            f"• RSI(14) пробил уровень 30 вниз: **{rsi}**\n"
+                            f"💰 **PnL:** `{pnl_str}`"
+                        )
+                        send_telegram_msg(msg)
+
+            # 2. ПРОВЕРКА SHORT
+            elif pos_side == "short":
+                # Тейк-профит exit
+                if rsi <= RSI_SHORT_EXIT:
+                    close_res = close_okx_position(inst_id, "short")
+                    if close_res.get("code") == "0":
+                        msg = (
+                            f"🎯 **Тейк-профит SHORT по `{inst_id}`**\n"
+                            f"• Закрытая свеча 15m RSI(14): **{rsi}** (порог <= {RSI_SHORT_EXIT})\n"
+                            f"💰 **PnL:** `{pnl_str}`"
+                        )
+                        send_telegram_msg(msg)
+
+                # Инвалидация сделки
+                elif rsi >= RSI_SHORT_INVALID:
+                    close_res = close_okx_position(inst_id, "short")
+                    if close_res.get("code") == "0":
+                        msg = (
+                            f"🚨 **ИНВАЛИДАЦИЯ SHORT по `{inst_id}`**\n"
+                            f"• RSI(14) пробил уровень 70 вверх: **{rsi}**\n"
+                            f"💰 **PnL:** `{pnl_str}`"
+                        )
+                        send_telegram_msg(msg)
 
     except Exception as e:
         print(f"Ошибка проверки RSI: {e}")
@@ -245,7 +267,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     if last_price <= 0:
         return False, f"Не удалось получить цену для `{inst_id}`."
 
-    # Устанавливаем МАКСИМАЛЬНОЕ плечо монеты на OKX перед ордером
     set_okx_leverage(inst_id, max_lev)
 
     min_contract_notional = ct_val * lot_sz * last_price
@@ -271,7 +292,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     actual_notional_usdt = contracts_qty * ct_val * last_price
     actual_margin_used = actual_notional_usdt / max_lev
 
-    # РАСЧЕТ ТОЧНОСТИ ЦЕНЫ ДЛЯ СТОП-ЛОССА С УЧЕТОМ TICK_SZ ОКХ
     tick_sz_float = float(tick_sz_str)
     if '.' in tick_sz_str:
         precision = len(tick_sz_str.split('.')[1].rstrip('0'))
@@ -283,7 +303,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     else:
         raw_sl = last_price * 1.05
 
-    # Округление цены до кратности tickSz
     sl_price = math.floor(raw_sl / tick_sz_float) * tick_sz_float if side_type == "LONG" else math.ceil(raw_sl / tick_sz_float) * tick_sz_float
 
     if precision > 0:
@@ -328,7 +347,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
 def send_telegram_signal(symbol, signal_type, is_averaging=False):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     emoji = "🔴" if signal_type == "SHORT" else "🟢"
-    action_title = "УСРЕДНЕНИЕ (ДОБОР)" if is_averaging else "СИГНАЛ (RETEST)"
+    action_title = "УСРЕДНЕНИЕ (ДОБОР)" if is_averaging else f"СИГНАЛ ({'SPRING' if signal_type == 'LONG' else 'UPTHRUST'})"
 
     text = (
         f"{emoji} **{action_title}**\n\n"
@@ -349,6 +368,7 @@ def send_telegram_signal(symbol, signal_type, is_averaging=False):
         print(f"Ошибка отправки сигнала: {e}")
 
 def parse_alert(text):
+    """Парсинг названий инструментов и паттернов Вайкоффа"""
     symbol = "UNKNOWN"
     signal_type = "UNKNOWN"
 
@@ -357,10 +377,15 @@ def parse_alert(text):
         if isinstance(data, dict):
             symbol = data.get("instrument") or data.get("symbol") or data.get("ticker") or "UNKNOWN"
             action = str(data.get("action") or data.get("signal") or "").lower()
-            if "buy level retest" in action:
+            
+            if "spring" in action:
                 signal_type = "ENTRY_LONG"
-            elif "sell level retest" in action:
+            elif "upthrust" in action:
                 signal_type = "ENTRY_SHORT"
+            elif "markup" in action:
+                signal_type = "EXIT_LONG"
+            elif "markdown" in action:
+                signal_type = "EXIT_SHORT"
     except Exception:
         pass
 
@@ -371,10 +396,14 @@ def parse_alert(text):
 
     text_lower = text.lower()
     if signal_type == "UNKNOWN":
-        if "buy level retest" in text_lower:
+        if "spring" in text_lower:
             signal_type = "ENTRY_LONG"
-        elif "sell level retest" in text_lower:
+        elif "upthrust" in text_lower:
             signal_type = "ENTRY_SHORT"
+        elif "markup" in text_lower:
+            signal_type = "EXIT_LONG"
+        elif "markdown" in text_lower:
+            signal_type = "EXIT_SHORT"
 
     return symbol, signal_type
 
@@ -393,6 +422,7 @@ def webhook():
     pos_info = next((p for p in positions if p["instId"] == inst_id), None)
     current_pos = pos_info["posSide"] if pos_info else None
 
+    # --- 1. ВХОД В LONG (SPRING) ---
     if signal_type == "ENTRY_LONG":
         if current_pos == "short":
             upl = pos_info.get("upl", 0.0)
@@ -402,7 +432,7 @@ def webhook():
                 pnl_sign = "+" if upl >= 0 else ""
                 pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
                 msg = (
-                    f"🔄 **Закрыт SHORT по `{inst_id}`** (получен противоположный Buy level retest).\n"
+                    f"🔄 **Закрыт SHORT по `{inst_id}`** (получен сигнал Spring / LONG).\n"
                     f"💰 **PnL:** `{pnl_str}`"
                 )
                 send_telegram_msg(msg)
@@ -410,6 +440,7 @@ def webhook():
         is_avg = (current_pos == "long")
         send_telegram_signal(symbol, "LONG", is_averaging=is_avg)
 
+    # --- 2. ВХОД В SHORT (UPTHRUST) ---
     elif signal_type == "ENTRY_SHORT":
         if current_pos == "long":
             upl = pos_info.get("upl", 0.0)
@@ -419,13 +450,43 @@ def webhook():
                 pnl_sign = "+" if upl >= 0 else ""
                 pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
                 msg = (
-                    f"🔄 **Закрыт LONG по `{inst_id}`** (получен противоположный Sell level retest).\n"
+                    f"🔄 **Закрыт LONG по `{inst_id}`** (получен сигнал Upthrust / SHORT).\n"
                     f"💰 **PnL:** `{pnl_str}`"
                 )
                 send_telegram_msg(msg)
 
         is_avg = (current_pos == "short")
         send_telegram_signal(symbol, "SHORT", is_averaging=is_avg)
+
+    # --- 3. ВЫХОД ИЗ LONG (MARKUP) ---
+    elif signal_type == "EXIT_LONG":
+        if current_pos == "long":
+            upl = pos_info.get("upl", 0.0)
+            upl_ratio = pos_info.get("uplRatio", 0.0)
+            close_res = close_okx_position(inst_id, "long")
+            if close_res.get("code") == "0":
+                pnl_sign = "+" if upl >= 0 else ""
+                pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+                msg = (
+                    f"🎯 **Закрыт LONG по `{inst_id}`** (получен сигнал Markup).\n"
+                    f"💰 **PnL:** `{pnl_str}`"
+                )
+                send_telegram_msg(msg)
+
+    # --- 4. ВЫХОД ИЗ SHORT (MARKDOWN) ---
+    elif signal_type == "EXIT_SHORT":
+        if current_pos == "short":
+            upl = pos_info.get("upl", 0.0)
+            upl_ratio = pos_info.get("uplRatio", 0.0)
+            close_res = close_okx_position(inst_id, "short")
+            if close_res.get("code") == "0":
+                pnl_sign = "+" if upl >= 0 else ""
+                pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+                msg = (
+                    f"🎯 **Закрыт SHORT по `{inst_id}`** (получен сигнал Markdown).\n"
+                    f"💰 **PnL:** `{pnl_str}`"
+                )
+                send_telegram_msg(msg)
 
     return "OK", 200
 
@@ -485,7 +546,7 @@ def telegram_callback():
 
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Signal Bot is Running!", 200
+    return "OKX Signal Bot (Wyckoff + RSI) is Running!", 200
 
 # ИНИЦИАЛИЗАЦИЯ ПЛАНИРОВЩИКА СТРОГО ПО 15M СВЕЧАМ
 scheduler = BackgroundScheduler(daemon=True)
