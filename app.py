@@ -24,11 +24,8 @@ OKX_BASE_URL = "https://www.okx.com"
 
 # НАСТРОЙКИ ВЫХОДА И ИНВАЛИДАЦИИ ПО RSI(14)
 RSI_TIMEFRAME = "15m"       # Таймфрейм свечей
-RSI_LONG_EXIT = 70.0       # Тейк-профит LONG (RSI >= 70)
-RSI_LONG_INVALID = 30.0     # Инвалидация LONG (RSI <= 30)
-
-RSI_SHORT_EXIT = 30.0      # Тейк-профит SHORT (RSI <= 30)
-RSI_SHORT_INVALID = 70.0    # Инвалидация SHORT (RSI >= 70)
+RSI_LEVEL_HIGH = 70.0      # Верхний уровень RSI
+RSI_LEVEL_LOW = 30.0       # Нижний уровень RSI
 
 # Временное хранилище ожидания ввода маржи (в памяти)
 PENDING_TRADES = {}
@@ -113,7 +110,8 @@ def close_okx_position(inst_id, pos_side):
 
 # ================= РАСЧЕТ RSI(14) ПО ЗАКРЫТЫМ СВЕЧАМ =================
 
-def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
+def calculate_rsi14_history(inst_id, timeframe=RSI_TIMEFRAME):
+    """Возвращает массив значений RSI(14) для закрытых свечей (от старых к новым)"""
     res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit=100")
     if res.get("code") != "0" or not res.get("data"):
         return None
@@ -147,35 +145,43 @@ def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
     avg_gain = sum(gains[:14]) / 14.0
     avg_loss = sum(losses[:14]) / 14.0
 
+    rsi_values = []
+
     for i in range(14, len(gains)):
         avg_gain = (avg_gain * 13.0 + gains[i]) / 14.0
         avg_loss = (avg_loss * 13.0 + losses[i]) / 14.0
 
-    if avg_loss == 0:
-        return 100.0
-    if avg_gain == 0:
-        return 0.0
+        if avg_loss == 0:
+            rsi = 100.0
+        elif avg_gain == 0:
+            rsi = 0.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi = 100.0 - (100.0 / (1.0 + rs))
 
-    rs = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return round(rsi, 2)
+        rsi_values.append(round(rsi, 2))
+
+    return rsi_values
 
 def check_and_close_positions_by_rsi():
-    """Проверка RSI на 15m свече: выход по профиту или инвалидация сделки"""
+    """Проверка ПЕРЕСЕЧЕНИЯ (Crossover / Crossunder) RSI по 15m свече"""
     try:
         positions = get_okx_all_positions()
         if not positions:
             return
 
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Проверка RSI по закрытию 15м свечи...")
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Проверка пересечения RSI по закрытию 15м свечи...")
 
         for pos in positions:
             inst_id = pos["instId"]
             pos_side = pos["posSide"]
-            rsi = calculate_rsi14(inst_id)
+            rsi_history = calculate_rsi14_history(inst_id)
 
-            if rsi is None:
+            if not rsi_history or len(rsi_history) < 2:
                 continue
+
+            prev_rsi = rsi_history[-2]  # Предпоследняя закрытая свеча
+            curr_rsi = rsi_history[-1]  # Последняя закрытая свеча
 
             upl = pos.get("upl", 0.0)
             upl_ratio = pos.get("uplRatio", 0.0)
@@ -184,48 +190,48 @@ def check_and_close_positions_by_rsi():
 
             # 1. ПРОВЕРКА LONG
             if pos_side == "long":
-                # Тейк-профит exit
-                if rsi >= RSI_LONG_EXIT:
+                # Тейк-профит: Пробитие 70 СНИЗУ ВВЕРХ
+                if prev_rsi < RSI_LEVEL_HIGH and curr_rsi >= RSI_LEVEL_HIGH:
                     close_res = close_okx_position(inst_id, "long")
                     if close_res.get("code") == "0":
                         msg = (
                             f"🎯 **Тейк-профит LONG по `{inst_id}`**\n"
-                            f"• Закрытая свеча 15m RSI(14): **{rsi}** (порог >= {RSI_LONG_EXIT})\n"
+                            f"• RSI(14) пробил 70 снизу вверх: **{prev_rsi} ➔ {curr_rsi}**\n"
                             f"💰 **PnL:** `{pnl_str}`"
                         )
                         send_telegram_msg(msg)
 
-                # Инвалидация сделки
-                elif rsi <= RSI_LONG_INVALID:
+                # Инвалидация: Пробитие 30 СВЕРХУ ВНИЗ
+                elif prev_rsi > RSI_LEVEL_LOW and curr_rsi <= RSI_LEVEL_LOW:
                     close_res = close_okx_position(inst_id, "long")
                     if close_res.get("code") == "0":
                         msg = (
                             f"🚨 **ИНВАЛИДАЦИЯ LONG по `{inst_id}`**\n"
-                            f"• RSI(14) пробил уровень 30 вниз: **{rsi}**\n"
+                            f"• RSI(14) пробил 30 сверху вниз: **{prev_rsi} ➔ {curr_rsi}**\n"
                             f"💰 **PnL:** `{pnl_str}`"
                         )
                         send_telegram_msg(msg)
 
             # 2. ПРОВЕРКА SHORT
             elif pos_side == "short":
-                # Тейк-профит exit
-                if rsi <= RSI_SHORT_EXIT:
+                # Тейк-профит: Пробитие 30 СВЕРХУ ВНИЗ
+                if prev_rsi > RSI_LEVEL_LOW and curr_rsi <= RSI_LEVEL_LOW:
                     close_res = close_okx_position(inst_id, "short")
                     if close_res.get("code") == "0":
                         msg = (
                             f"🎯 **Тейк-профит SHORT по `{inst_id}`**\n"
-                            f"• Закрытая свеча 15m RSI(14): **{rsi}** (порог <= {RSI_SHORT_EXIT})\n"
+                            f"• RSI(14) пробил 30 сверху вниз: **{prev_rsi} ➔ {curr_rsi}**\n"
                             f"💰 **PnL:** `{pnl_str}`"
                         )
                         send_telegram_msg(msg)
 
-                # Инвалидация сделки
-                elif rsi >= RSI_SHORT_INVALID:
+                # Инвалидация: Пробитие 70 СНИЗУ ВВЕРХ
+                elif prev_rsi < RSI_LEVEL_HIGH and curr_rsi >= RSI_LEVEL_HIGH:
                     close_res = close_okx_position(inst_id, "short")
                     if close_res.get("code") == "0":
                         msg = (
                             f"🚨 **ИНВАЛИДАЦИЯ SHORT по `{inst_id}`**\n"
-                            f"• RSI(14) пробил уровень 70 вверх: **{rsi}**\n"
+                            f"• RSI(14) пробил 70 снизу вверх: **{prev_rsi} ➔ {curr_rsi}**\n"
                             f"💰 **PnL:** `{pnl_str}`"
                         )
                         send_telegram_msg(msg)
@@ -290,7 +296,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     actual_notional_usdt = contracts_qty * ct_val * last_price
     actual_margin_used = actual_notional_usdt / max_lev
 
-    # Рыночный ордер без прикреплённых алго-ордеров стоп-лосса
     order_body = {
         "instId": inst_id,
         "tdMode": "cross",
@@ -519,7 +524,7 @@ def telegram_callback():
 
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Signal Bot (Wyckoff + RSI) is Running!", 200
+    return "OKX Signal Bot (Wyckoff + RSI Crossover) is Running!", 200
 
 # ИНИЦИАЛИЗАЦИЯ ПЛАНИРОВЩИКА СТРОГО ПО 15M СВЕЧАМ
 scheduler = BackgroundScheduler(daemon=True)
