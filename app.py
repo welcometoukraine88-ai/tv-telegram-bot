@@ -22,10 +22,10 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 
 OKX_BASE_URL = "https://www.okx.com"
 
-# НАСТРОЙКИ ВЫХОДА И ИНВАЛИДАЦИИ ПО RSI(14)
+# НАСТРОЙКИ ТЕЙК-ПРОФИТА ПО RSI(14)
 RSI_TIMEFRAME = "15m"       # Таймфрейм свечей
-RSI_LEVEL_HIGH = 70.0      # Верхний уровень RSI
-RSI_LEVEL_LOW = 30.0       # Нижний уровень RSI
+RSI_LEVEL_HIGH = 70.0      # Верхний уровень RSI (TP LONG)
+RSI_LEVEL_LOW = 30.0       # Нижний уровень RSI (TP SHORT)
 
 # Временное хранилище ожидания ввода маржи (в памяти)
 PENDING_TRADES = {}
@@ -164,13 +164,13 @@ def calculate_rsi14_history(inst_id, timeframe=RSI_TIMEFRAME):
     return rsi_values
 
 def check_and_close_positions_by_rsi():
-    """Проверка ПЕРЕСЕЧЕНИЯ (Crossover / Crossunder) RSI по 15m свече"""
+    """Проверка ТЕЙК-ПРОФИТА (Crossover / Crossunder) по RSI 15m"""
     try:
         positions = get_okx_all_positions()
         if not positions:
             return
 
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Проверка пересечения RSI по закрытию 15м свечи...")
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Проверка тейк-профитов RSI по закрытию 15м свечи...")
 
         for pos in positions:
             inst_id = pos["instId"]
@@ -188,9 +188,8 @@ def check_and_close_positions_by_rsi():
             pnl_sign = "+" if upl >= 0 else ""
             pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-            # 1. ПРОВЕРКА LONG
+            # 1. ТЕЙК-ПРОФИТ LONG: Пробитие 70 СНИЗУ ВВЕРХ
             if pos_side == "long":
-                # Тейк-профит: Пробитие 70 СНИЗУ ВВЕРХ
                 if prev_rsi < RSI_LEVEL_HIGH and curr_rsi >= RSI_LEVEL_HIGH:
                     close_res = close_okx_position(inst_id, "long")
                     if close_res.get("code") == "0":
@@ -201,37 +200,14 @@ def check_and_close_positions_by_rsi():
                         )
                         send_telegram_msg(msg)
 
-                # Инвалидация: Пробитие 30 СВЕРХУ ВНИЗ
-                elif prev_rsi > RSI_LEVEL_LOW and curr_rsi <= RSI_LEVEL_LOW:
-                    close_res = close_okx_position(inst_id, "long")
-                    if close_res.get("code") == "0":
-                        msg = (
-                            f"🚨 **ИНВАЛИДАЦИЯ LONG по `{inst_id}`**\n"
-                            f"• RSI(14) пробил 30 сверху вниз: **{prev_rsi} ➔ {curr_rsi}**\n"
-                            f"💰 **PnL:** `{pnl_str}`"
-                        )
-                        send_telegram_msg(msg)
-
-            # 2. ПРОВЕРКА SHORT
+            # 2. ТЕЙК-ПРОФИТ SHORT: Пробитие 30 СВЕРХУ ВНИЗ
             elif pos_side == "short":
-                # Тейк-профит: Пробитие 30 СВЕРХУ ВНИЗ
                 if prev_rsi > RSI_LEVEL_LOW and curr_rsi <= RSI_LEVEL_LOW:
                     close_res = close_okx_position(inst_id, "short")
                     if close_res.get("code") == "0":
                         msg = (
                             f"🎯 **Тейк-профит SHORT по `{inst_id}`**\n"
                             f"• RSI(14) пробил 30 сверху вниз: **{prev_rsi} ➔ {curr_rsi}**\n"
-                            f"💰 **PnL:** `{pnl_str}`"
-                        )
-                        send_telegram_msg(msg)
-
-                # Инвалидация: Пробитие 70 СНИЗУ ВВЕРХ
-                elif prev_rsi < RSI_LEVEL_HIGH and curr_rsi >= RSI_LEVEL_HIGH:
-                    close_res = close_okx_position(inst_id, "short")
-                    if close_res.get("code") == "0":
-                        msg = (
-                            f"🚨 **ИНВАЛИДАЦИЯ SHORT по `{inst_id}`**\n"
-                            f"• RSI(14) пробил 70 снизу вверх: **{prev_rsi} ➔ {curr_rsi}**\n"
                             f"💰 **PnL:** `{pnl_str}`"
                         )
                         send_telegram_msg(msg)
@@ -524,7 +500,7 @@ def telegram_callback():
 
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Signal Bot (Wyckoff + RSI Crossover) is Running!", 200
+    return "OKX Signal Bot is Running!", 200
 
 # ИНИЦИАЛИЗАЦИЯ ПЛАНИРОВЩИКА СТРОГО ПО 15M СВЕЧАМ
 scheduler = BackgroundScheduler(daemon=True)
