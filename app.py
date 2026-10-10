@@ -111,45 +111,60 @@ def close_okx_position(inst_id, pos_side):
 # ================= РАСЧЕТ RSI(14) ПО ЗАКРЫТЫМ СВЕЧАМ =================
 
 def calculate_rsi14_history(inst_id, timeframe=RSI_TIMEFRAME):
-    """Возвращает массив значений RSI(14) для закрытых свечей (от старых к новым)"""
-    res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit=100")
+    """
+    Точный расчет RSI(14) по методу RMA (Wilder's Smoothing), 
+    в точности повторяющий стандартный индикатор TradingView.
+    """
+    # Запрашиваем 200 свечей для правильной «раскачки» сглаживания RMA
+    res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit=200")
     if res.get("code") != "0" or not res.get("data"):
         return None
 
     raw_candles = res["data"]
+    # Берем только закрытые свечи (индекс 8 равен "1" в OKX API)
     closed_candles = [c for c in raw_candles if c[8] == "1"]
 
     if len(closed_candles) < 30:
         closed_candles = raw_candles[1:]
 
-    if len(closed_candles) < 20:
+    if len(closed_candles) < 50:
         return None
 
+    # OKX отдает свечи от новых к старым, разворачиваем от старых к новым
     candles = list(reversed(closed_candles))
     closes = [float(c[4]) for c in candles]
 
-    gains = []
-    losses = []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        if diff >= 0:
-            gains.append(diff)
-            losses.append(0.0)
-        else:
-            gains.append(0.0)
-            losses.append(abs(diff))
+    # Считаем изменения цены (ta.change)
+    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    
+    gains = [max(c, 0.0) for c in changes]
+    losses = [abs(min(c, 0.0)) for c in changes]
 
-    if len(gains) < 14:
+    length = 14
+    if len(gains) < length:
         return None
-
-    avg_gain = sum(gains[:14]) / 14.0
-    avg_loss = sum(losses[:14]) / 14.0
 
     rsi_values = []
 
-    for i in range(14, len(gains)):
-        avg_gain = (avg_gain * 13.0 + gains[i]) / 14.0
-        avg_loss = (avg_loss * 13.0 + losses[i]) / 14.0
+    # 1. Первый шаг: классическое SMA для инициализации RMA (как в TradingView)
+    avg_gain = sum(gains[:length]) / length
+    avg_loss = sum(losses[:length]) / length
+
+    # Расчет RSI для первой точки
+    if avg_loss == 0:
+        rsi = 100.0
+    elif avg_gain == 0:
+        rsi = 0.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi_values.append(round(rsi, 2))
+
+    # 2. Дальнейшие шаги: рекурсивная формула RMA (Wilder's Smoothing)
+    # Формула TV: avg = (previous_avg * (length - 1) + current_value) / length
+    for i in range(length, len(gains)):
+        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
+        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
 
         if avg_loss == 0:
             rsi = 100.0
