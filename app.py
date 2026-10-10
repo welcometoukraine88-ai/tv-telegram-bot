@@ -298,10 +298,10 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
 
 # ================= TELEGRAM & WEBHOOKS =================
 
-def send_telegram_signal(symbol, signal_type, is_averaging=False):
+def send_telegram_signal(symbol, signal_type, is_averaging=False, pattern_name="SPRING"):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     emoji = "🔴" if signal_type == "SHORT" else "🟢"
-    action_title = "УСРЕДНЕНИЕ (ДОБОР)" if is_averaging else f"СИГНАЛ ({'SPRING' if signal_type == 'LONG' else 'UPTHRUST'})"
+    action_title = "УСРЕДНЕНИЕ (ДОБОР)" if is_averaging else f"СИГНАЛ ({pattern_name})"
 
     text = (
         f"{emoji} **{action_title}**\n\n"
@@ -322,49 +322,56 @@ def send_telegram_signal(symbol, signal_type, is_averaging=False):
         print(f"Ошибка отправки сигнала: {e}")
 
 def parse_alert(text):
-    """Парсинг названий инструментов и паттернов Вайкоффа"""
+    """Парсинг названий инструментов (включая формат METAUSDT.P) и паттернов Вайкоффа"""
     symbol = "UNKNOWN"
     signal_type = "UNKNOWN"
+    pattern_name = "SIGNAL"
+
+    text_str = text if isinstance(text, str) else json.dumps(text)
 
     try:
-        data = json.loads(text)
+        data = json.loads(text_str)
         if isinstance(data, dict):
-            symbol = data.get("instrument") or data.get("symbol") or data.get("ticker") or "UNKNOWN"
-            action = str(data.get("action") or data.get("signal") or "").lower()
-            
-            if "spring" in action:
-                signal_type = "ENTRY_LONG"
-            elif "upthrust" in action:
-                signal_type = "ENTRY_SHORT"
-            elif "markup" in action:
-                signal_type = "EXIT_LONG"
-            elif "markdown" in action:
-                signal_type = "EXIT_SHORT"
+            raw_sym = data.get("instrument") or data.get("symbol") or data.get("ticker") or ""
+            if raw_sym:
+                symbol = raw_sym.split(":")[-1].strip() if ":" in raw_sym else raw_sym.strip()
     except Exception:
         pass
 
     if symbol == "UNKNOWN":
-        match = re.search(r'([A-Z0-9]+USDT(?:\.P)?)', text)
+        match = re.search(r'(?:[A-Z0-9]+:)?([A-Z0-9]+\.P|[A-Z0-9]+USDT)', text_str)
         if match:
             symbol = match.group(1)
+            if ":" in symbol:
+                symbol = symbol.split(":")[-1]
 
-    text_lower = text.lower()
-    if signal_type == "UNKNOWN":
-        if "spring" in text_lower:
-            signal_type = "ENTRY_LONG"
-        elif "upthrust" in text_lower:
-            signal_type = "ENTRY_SHORT"
-        elif "markup" in text_lower:
-            signal_type = "EXIT_LONG"
-        elif "markdown" in text_lower:
-            signal_type = "EXIT_SHORT"
+    text_lower = text_str.lower()
+    
+    if "spring confirmed" in text_lower:
+        signal_type = "ENTRY_LONG"
+        pattern_name = "SPRING CONFIRMED"
+    elif "spring" in text_lower:
+        signal_type = "ENTRY_LONG"
+        pattern_name = "SPRING"
+    elif "utad confirmed" in text_lower:
+        signal_type = "ENTRY_SHORT"
+        pattern_name = "UTAD CONFIRMED"
+    elif "upthrust" in text_lower:
+        signal_type = "ENTRY_SHORT"
+        pattern_name = "UPTHRUST"
+    elif "markup" in text_lower:
+        signal_type = "EXIT_LONG"
+        pattern_name = "MARKUP"
+    elif "markdown" in text_lower:
+        signal_type = "EXIT_SHORT"
+        pattern_name = "MARKDOWN"
 
-    return symbol, signal_type
+    return symbol, signal_type, pattern_name
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     raw_data = request.get_data(as_text=True)
-    symbol, signal_type = parse_alert(raw_data)
+    symbol, signal_type, pattern_name = parse_alert(raw_data)
 
     if symbol == "UNKNOWN" or signal_type == "UNKNOWN":
         return "Ignored", 200
@@ -376,7 +383,7 @@ def webhook():
     pos_info = next((p for p in positions if p["instId"] == inst_id), None)
     current_pos = pos_info["posSide"] if pos_info else None
 
-    # --- 1. ВХОД В LONG (SPRING) ---
+    # --- 1. ВХОД В LONG (SPRING / SPRING CONFIRMED) ---
     if signal_type == "ENTRY_LONG":
         if current_pos == "short":
             upl = pos_info.get("upl", 0.0)
@@ -386,15 +393,15 @@ def webhook():
                 pnl_sign = "+" if upl >= 0 else ""
                 pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
                 msg = (
-                    f"🔄 **Закрыт SHORT по `{inst_id}`** (получен сигнал Spring / LONG).\n"
+                    f"🔄 **Закрыт SHORT по `{inst_id}`** (получен разворотный сигнал {pattern_name}).\n"
                     f"💰 **PnL:** `{pnl_str}`"
                 )
                 send_telegram_msg(msg)
 
         is_avg = (current_pos == "long")
-        send_telegram_signal(symbol, "LONG", is_averaging=is_avg)
+        send_telegram_signal(symbol, "LONG", is_averaging=is_avg, pattern_name=pattern_name)
 
-    # --- 2. ВХОД В SHORT (UPTHRUST) ---
+    # --- 2. ВХОД В SHORT (UPTHRUST / UTAD CONFIRMED) ---
     elif signal_type == "ENTRY_SHORT":
         if current_pos == "long":
             upl = pos_info.get("upl", 0.0)
@@ -404,13 +411,13 @@ def webhook():
                 pnl_sign = "+" if upl >= 0 else ""
                 pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
                 msg = (
-                    f"🔄 **Закрыт LONG по `{inst_id}`** (получен сигнал Upthrust / SHORT).\n"
+                    f"🔄 **Закрыт LONG по `{inst_id}`** (получен разворотный сигнал {pattern_name}).\n"
                     f"💰 **PnL:** `{pnl_str}`"
                 )
                 send_telegram_msg(msg)
 
         is_avg = (current_pos == "short")
-        send_telegram_signal(symbol, "SHORT", is_averaging=is_avg)
+        send_telegram_signal(symbol, "SHORT", is_averaging=is_avg, pattern_name=pattern_name)
 
     # --- 3. ВЫХОД ИЗ LONG (MARKUP) ---
     elif signal_type == "EXIT_LONG":
@@ -500,7 +507,7 @@ def telegram_callback():
 
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Signal Bot is Running!", 200
+    return "OKX Signal Bot (Multi-Signal & Auto-Flip) is Running!", 200
 
 # ИНИЦИАЛИЗАЦИЯ ПЛАНИРОВЩИКА СТРОГО ПО 15M СВЕЧАМ
 scheduler = BackgroundScheduler(daemon=True)
