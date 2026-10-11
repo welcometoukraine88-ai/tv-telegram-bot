@@ -108,20 +108,18 @@ def close_okx_position(inst_id, pos_side):
     }
     return okx_request("POST", "/api/v5/trade/close-position", body)
 
-# ================= РАСЧЕТ RSI(14) ПО ЗАКРЫТЫМ СВЕЧАМ =================
+# ================= ТОЧНЫЙ РАСЧЕТ RSI(14) ПО TRADINGVIEW (RMA) =================
 
 def calculate_rsi14_history(inst_id, timeframe=RSI_TIMEFRAME):
     """
     Точный расчет RSI(14) по методу RMA (Wilder's Smoothing), 
     в точности повторяющий стандартный индикатор TradingView.
     """
-    # Запрашиваем 200 свечей для правильной «раскачки» сглаживания RMA
     res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit=200")
     if res.get("code") != "0" or not res.get("data"):
         return None
 
     raw_candles = res["data"]
-    # Берем только закрытые свечи (индекс 8 равен "1" в OKX API)
     closed_candles = [c for c in raw_candles if c[8] == "1"]
 
     if len(closed_candles) < 30:
@@ -130,11 +128,9 @@ def calculate_rsi14_history(inst_id, timeframe=RSI_TIMEFRAME):
     if len(closed_candles) < 50:
         return None
 
-    # OKX отдает свечи от новых к старым, разворачиваем от старых к новым
     candles = list(reversed(closed_candles))
     closes = [float(c[4]) for c in candles]
 
-    # Считаем изменения цены (ta.change)
     changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
     
     gains = [max(c, 0.0) for c in changes]
@@ -146,11 +142,10 @@ def calculate_rsi14_history(inst_id, timeframe=RSI_TIMEFRAME):
 
     rsi_values = []
 
-    # 1. Первый шаг: классическое SMA для инициализации RMA (как в TradingView)
+    # 1. Первый шаг: SMA для инициализации RMA (как в TradingView)
     avg_gain = sum(gains[:length]) / length
     avg_loss = sum(losses[:length]) / length
 
-    # Расчет RSI для первой точки
     if avg_loss == 0:
         rsi = 100.0
     elif avg_gain == 0:
@@ -160,8 +155,7 @@ def calculate_rsi14_history(inst_id, timeframe=RSI_TIMEFRAME):
         rsi = 100.0 - (100.0 / (1.0 + rs))
     rsi_values.append(round(rsi, 2))
 
-    # 2. Дальнейшие шаги: рекурсивная формула RMA (Wilder's Smoothing)
-    # Формула TV: avg = (previous_avg * (length - 1) + current_value) / length
+    # 2. Рекурсивный шаг RMA (Wilder's)
     for i in range(length, len(gains)):
         avg_gain = (avg_gain * (length - 1) + gains[i]) / length
         avg_loss = (avg_loss * (length - 1) + losses[i]) / length
@@ -210,7 +204,7 @@ def check_and_close_positions_by_rsi():
                     if close_res.get("code") == "0":
                         msg = (
                             f"🎯 **Тейк-профит LONG по `{inst_id}`**\n"
-                            f"• RSI(14) пробил 70 снизу вверх: **{prev_rsi} ➔ {curr_rsi}**\n"
+                            f"• RSI(14) TV пробил 70 снизу вверх: **{prev_rsi} ➔ {curr_rsi}**\n"
                             f"💰 **PnL:** `{pnl_str}`"
                         )
                         send_telegram_msg(msg)
@@ -222,7 +216,7 @@ def check_and_close_positions_by_rsi():
                     if close_res.get("code") == "0":
                         msg = (
                             f"🎯 **Тейк-профит SHORT по `{inst_id}`**\n"
-                            f"• RSI(14) пробил 30 сверху вниз: **{prev_rsi} ➔ {curr_rsi}**\n"
+                            f"• RSI(14) TV пробил 30 сверху вниз: **{prev_rsi} ➔ {curr_rsi}**\n"
                             f"💰 **PnL:** `{pnl_str}`"
                         )
                         send_telegram_msg(msg)
@@ -336,7 +330,65 @@ def send_telegram_signal(symbol, signal_type, is_averaging=False, pattern_name="
     except Exception as e:
         print(f"Ошибка отправки сигнала: {e}")
 
-def parse_alert
+def parse_alert(text):
+    """
+    Парсер для всех сигналов Вайкоффа и извлечения тикера
+    """
+    symbol = "UNKNOWN"
+    signal_type = "UNKNOWN"
+    pattern_name = "SIGNAL"
+
+    text_str = text if isinstance(text, str) else json.dumps(text)
+
+    try:
+        data = json.loads(text_str)
+        if isinstance(data, dict):
+            raw_sym = data.get("instrument") or data.get("symbol") or data.get("ticker") or ""
+            if raw_sym:
+                symbol = raw_sym.split(":")[-1].strip() if ":" in raw_sym else raw_sym.strip()
+    except Exception:
+        pass
+
+    if symbol == "UNKNOWN":
+        match = re.search(r'(?:[A-Z0-9]+:)?([A-Z0-9]+\.P|[A-Z0-9]+USDT)', text_str)
+        if match:
+            symbol = match.group(1)
+            if ":" in symbol:
+                symbol = symbol.split(":")[-1]
+
+    text_lower = text_str.lower()
+    
+    # 1. СИГНАЛЫ LONG
+    if "spring recovery" in text_lower:
+        signal_type = "ENTRY_LONG"
+        pattern_name = "SPRING RECOVERY"
+    elif "spring confirmed" in text_lower:
+        signal_type = "ENTRY_LONG"
+        pattern_name = "SPRING CONFIRMED"
+    elif "spring" in text_lower:
+        signal_type = "ENTRY_LONG"
+        pattern_name = "SPRING"
+
+    # 2. СИГНАЛЫ SHORT
+    elif "utad recovery" in text_lower:
+        signal_type = "ENTRY_SHORT"
+        pattern_name = "UTAD RECOVERY"
+    elif "utad confirmed" in text_lower:
+        signal_type = "ENTRY_SHORT"
+        pattern_name = "UTAD CONFIRMED"
+    elif "upthrust" in text_lower:
+        signal_type = "ENTRY_SHORT"
+        pattern_name = "UPTHRUST"
+
+    # 3. ВЫХОДЫ
+    elif "markup" in text_lower:
+        signal_type = "EXIT_LONG"
+        pattern_name = "MARKUP"
+    elif "markdown" in text_lower:
+        signal_type = "EXIT_SHORT"
+        pattern_name = "MARKDOWN"
+
+    return symbol, signal_type, pattern_name
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -353,7 +405,7 @@ def webhook():
     pos_info = next((p for p in positions if p["instId"] == inst_id), None)
     current_pos = pos_info["posSide"] if pos_info else None
 
-    # --- 1. ВХОД В LONG (SPRING / SPRING CONFIRMED) ---
+    # --- 1. ВХОД В LONG (SPRING / SPRING CONFIRMED / SPRING RECOVERY) ---
     if signal_type == "ENTRY_LONG":
         if current_pos == "short":
             upl = pos_info.get("upl", 0.0)
@@ -371,7 +423,7 @@ def webhook():
         is_avg = (current_pos == "long")
         send_telegram_signal(symbol, "LONG", is_averaging=is_avg, pattern_name=pattern_name)
 
-    # --- 2. ВХОД В SHORT (UPTHRUST / UTAD CONFIRMED) ---
+    # --- 2. ВХОД В SHORT (UPTHRUST / UTAD CONFIRMED / UTAD RECOVERY) ---
     elif signal_type == "ENTRY_SHORT":
         if current_pos == "long":
             upl = pos_info.get("upl", 0.0)
@@ -477,7 +529,7 @@ def telegram_callback():
 
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Signal Bot (Multi-Signal & Auto-Flip) is Running!", 200
+    return "OKX Signal Bot is Running!", 200
 
 # ИНИЦИАЛИЗАЦИЯ ПЛАНИРОВЩИКА СТРОГО ПО 15M СВЕЧАМ
 scheduler = BackgroundScheduler(daemon=True)
