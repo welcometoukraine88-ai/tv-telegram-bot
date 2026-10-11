@@ -336,52 +336,7 @@ def send_telegram_signal(symbol, signal_type, is_averaging=False, pattern_name="
     except Exception as e:
         print(f"Ошибка отправки сигнала: {e}")
 
-def parse_alert(text):
-    """Парсинг названий инструментов (включая формат METAUSDT.P) и паттернов Вайкоффа"""
-    symbol = "UNKNOWN"
-    signal_type = "UNKNOWN"
-    pattern_name = "SIGNAL"
-
-    text_str = text if isinstance(text, str) else json.dumps(text)
-
-    try:
-        data = json.loads(text_str)
-        if isinstance(data, dict):
-            raw_sym = data.get("instrument") or data.get("symbol") or data.get("ticker") or ""
-            if raw_sym:
-                symbol = raw_sym.split(":")[-1].strip() if ":" in raw_sym else raw_sym.strip()
-    except Exception:
-        pass
-
-    if symbol == "UNKNOWN":
-        match = re.search(r'(?:[A-Z0-9]+:)?([A-Z0-9]+\.P|[A-Z0-9]+USDT)', text_str)
-        if match:
-            symbol = match.group(1)
-            if ":" in symbol:
-                symbol = symbol.split(":")[-1]
-
-    text_lower = text_str.lower()
-    
-    if "spring confirmed" in text_lower:
-        signal_type = "ENTRY_LONG"
-        pattern_name = "SPRING CONFIRMED"
-    elif "spring" in text_lower:
-        signal_type = "ENTRY_LONG"
-        pattern_name = "SPRING"
-    elif "utad confirmed" in text_lower:
-        signal_type = "ENTRY_SHORT"
-        pattern_name = "UTAD CONFIRMED"
-    elif "upthrust" in text_lower:
-        signal_type = "ENTRY_SHORT"
-        pattern_name = "UPTHRUST"
-    elif "markup" in text_lower:
-        signal_type = "EXIT_LONG"
-        pattern_name = "MARKUP"
-    elif "markdown" in text_lower:
-        signal_type = "EXIT_SHORT"
-        pattern_name = "MARKDOWN"
-
-    return symbol, signal_type, pattern_name
+def parse_alert
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
