@@ -28,9 +28,9 @@ RSI_TRAIL_SHORT = 35.0
 RSI_SL_LONG = 30.0
 RSI_SL_SHORT = 70.0
 
-# Единое хранилище настроек (по умолчанию 50 USDT, меняется через /margin)
+# Сумма маржи по умолчанию теперь ровно 1 USDT
 BOT_SETTINGS = {
-    "default_margin": 50.0
+    "default_margin": 1.0
 }
 
 STATS_DATA = {
@@ -369,7 +369,6 @@ def webhook():
     pos_info = next((p for p in positions if p["instId"] == inst_id), None)
     current_pos = pos_info["posSide"] if pos_info else None
 
-    # Читаем актуальную маржу строго из словаря BOT_SETTINGS
     current_margin = float(BOT_SETTINGS["default_margin"])
 
     if signal_type == "ENTRY_LONG":
