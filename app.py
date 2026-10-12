@@ -6,6 +6,8 @@ import math
 import base64
 import hmac
 import hashlib
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, request
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -29,9 +31,16 @@ RSI_TRAIL_SHORT = 35.0       # Трейлинг для SHORT
 RSI_SL_LONG = 30.0           # Стоп-лосс для LONG
 RSI_SL_SHORT = 70.0          # Стоп-лосс для SHORT
 
-# Хранилище настроек в памяти (дефолтная маржа на сделку — 50 USDT)
+# Хранилище настроек в памяти
 BOT_SETTINGS = {
     "default_margin": 50.0
+}
+
+# СТАТИСТИКА ДЛЯ ОТЧЕТОВ (за период)
+STATS_DATA = {
+    "tp_closed": 0,
+    "sl_closed": 0,
+    "total_pnl": 0.0
 }
 
 def get_okx_signature(timestamp, method, request_path, body=""):
@@ -196,29 +205,68 @@ def check_and_close_positions_by_rsi():
                 if curr_rsi < RSI_SL_LONG:
                     close_res = close_okx_position(inst_id, "long")
                     if close_res.get("code") == "0":
+                        STATS_DATA["sl_closed"] += 1
+                        STATS_DATA["total_pnl"] += upl
                         send_telegram_msg(f"🛑 **СТОП-ЛОСС LONG по `{inst_id}`**\n• RSI < 30: **{curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
                 elif curr_rsi >= RSI_TRAIL_LONG and prev_rsi > curr_rsi:
                     close_res = close_okx_position(inst_id, "long")
                     if close_res.get("code") == "0":
+                        STATS_DATA["tp_closed"] += 1
+                        STATS_DATA["total_pnl"] += upl
                         send_telegram_msg(f"🎯 **Трейлинг-стоп LONG по `{inst_id}`**\n• RSI разворот вниз: **{prev_rsi} ➔ {curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
 
             elif pos_side == "short":
                 if curr_rsi > RSI_SL_SHORT:
                     close_res = close_okx_position(inst_id, "short")
                     if close_res.get("code") == "0":
+                        STATS_DATA["sl_closed"] += 1
+                        STATS_DATA["total_pnl"] += upl
                         send_telegram_msg(f"🛑 **СТОП-ЛОСС SHORT по `{inst_id}`**\n• RSI > 70: **{curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
                 elif curr_rsi <= RSI_TRAIL_SHORT and prev_rsi < curr_rsi:
                     close_res = close_okx_position(inst_id, "short")
                     if close_res.get("code") == "0":
+                        STATS_DATA["tp_closed"] += 1
+                        STATS_DATA["total_pnl"] += upl
                         send_telegram_msg(f"🎯 **Трейлинг-стоп SHORT по `{inst_id}`**\n• RSI разворот вверх: **{prev_rsi} ➔ {curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
 
     except Exception as e:
         print(f"Ошибка проверки RSI: {e}")
 
+# ================= ПЕРИОДИЧЕСКИЙ ОТЧЕТ В ТЕЛЕГРАМ ПО КИЕВСКОМУ ВРЕМЕНИ =================
+
+def send_periodical_report():
+    try:
+        positions = get_okx_all_positions()
+        open_count = len(positions)
+
+        tp_count = STATS_DATA["tp_closed"]
+        sl_count = STATS_DATA["sl_closed"]
+        period_pnl = STATS_DATA["total_pnl"]
+
+        pnl_sign = "+" if period_pnl >= 0 else ""
+        pnl_str = f"{pnl_sign}${period_pnl:,.2f}"
+
+        report_msg = (
+            f"📊 **Периодический отчет бота**\n\n"
+            f"• Открытых сделок сейчас: **{open_count}**\n"
+            f"• Закрыто по ТП (трейлинг): **{tp_count}**\n"
+            f"• Закрыто по СЛ: **{sl_count}**\n"
+            f"• Общий PnL закрытых: `{pnl_str}`"
+        )
+
+        send_telegram_msg(report_msg)
+
+        # Сбрасываем счетчики периода
+        STATS_DATA["tp_closed"] = 0
+        STATS_DATA["sl_closed"] = 0
+        STATS_DATA["total_pnl"] = 0.0
+
+    except Exception as e:
+        print(f"Ошибка отправки периодического отчета: {e}")
+
 # ================= АВТОМАТИЧЕСКОЕ ИСПОЛНЕНИЕ ОРДЕРА =================
 
 def execute_okx_trade(symbol, side_type, margin_usdt):
-    """Открывает сделку с максимальным плечом автоматически"""
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
     okx_side = "sell" if side_type == "SHORT" else "buy"
@@ -318,7 +366,6 @@ def parse_alert(text):
 
     text_lower = text_str.lower()
     
-    # Строгий парсинг по ключевым словам SPRING и UPTHRUST
     if "spring" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "SPRING"
@@ -354,8 +401,9 @@ def webhook():
             upl_ratio = pos_info.get("uplRatio", 0.0)
             close_res = close_okx_position(inst_id, "short")
             if close_res.get("code") == "0":
+                STATS_DATA["total_pnl"] += upl
                 pnl_sign = "+" if upl >= 0 else ""
-                send_telegram_msg(f"🔄 **Закрыт SHORT по `{inst_id}`** (сигнал Spring).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
+                send_telegram_msg(f"🔄 **Закрыт SHORT по `{inst_id}`** (сигнал Spring разворот).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
 
         send_telegram_msg(f"🟢 **Сигнал SPRING ({symbol})**. Открываем LONG на **${current_margin}**...")
         success, res_msg = execute_okx_trade(symbol, "LONG", current_margin)
@@ -368,8 +416,9 @@ def webhook():
             upl_ratio = pos_info.get("uplRatio", 0.0)
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
+                STATS_DATA["total_pnl"] += upl
                 pnl_sign = "+" if upl >= 0 else ""
-                send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}`** (сигнал Upthrust).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
+                send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}`** (сигнал Upthrust разворот).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
 
         send_telegram_msg(f"🔴 **Сигнал UPTHRUST ({symbol})**. Открываем SHORT на **${current_margin}**...")
         success, res_msg = execute_okx_trade(symbol, "SHORT", current_margin)
@@ -406,10 +455,12 @@ def telegram_callback():
 
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Fully Automated Bot (Spring/Upthrust) is Running!", 200
+    return "OKX Fully Automated Bot with Reports is Running!", 200
 
-# ИНИЦИАЛИЗАЦИЯ ПЛАНИРОВЩИКА СТРОГО ПО 15M СВЕЧАМ
+# ИНИЦИАЛИЗАЦИЯ ПЛАНИРОВЩИКОВ
 scheduler = BackgroundScheduler(daemon=True)
+
+# 1. Проверка RSI (SL & Trailing) каждые 15 минут строго на 3-й секунде
 scheduler.add_job(
     func=check_and_close_positions_by_rsi,
     trigger='cron',
@@ -417,6 +468,18 @@ scheduler.add_job(
     second='3',
     id='rsi_checker_job'
 )
+
+# 2. Периодический отчет по Киевскому времени в 8, 10, 12, 14, 16, 18, 20, 22 часа
+scheduler.add_job(
+    func=send_periodical_report,
+    trigger='cron',
+    hour='8,10,12,14,16,18,20,22',
+    minute='0',
+    second='0',
+    timezone=ZoneInfo('Europe/Kyiv'),
+    id='periodical_report_job'
+)
+
 scheduler.start()
 
 if __name__ == '__main__':
