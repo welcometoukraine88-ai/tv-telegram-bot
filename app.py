@@ -215,7 +215,7 @@ def check_and_close_positions_by_rsi():
     except Exception as e:
         print(f"Ошибка проверки RSI: {e}")
 
-# ================= АВТОМАТИЧЕСКОЕ И СПОЛНЕНИЕ ОРДЕРА =================
+# ================= АВТОМАТИЧЕСКОЕ ИСПОЛНЕНИЕ ОРДЕРА =================
 
 def execute_okx_trade(symbol, side_type, margin_usdt):
     """Открывает сделку с максимальным плечом автоматически"""
@@ -291,7 +291,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         msg = res.get("data", [{}])[0].get("sMsg") or res.get("msg")
         return False, f"Ошибка OKX: {msg}"
 
-# ================= ПАРСЕР АЛЕРТОВ =================
+# ================= ПАРСЕР АЛЕРТОВ (SPRING / UPTHRUST) =================
 
 def parse_alert(text):
     symbol = "UNKNOWN"
@@ -318,12 +318,13 @@ def parse_alert(text):
 
     text_lower = text_str.lower()
     
+    # Строгий парсинг по ключевым словам SPRING и UPTHRUST
     if "spring" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "SPRING"
-    elif "ut" in text_lower or re.search(r'\but\b', text_lower):
+    elif "upthrust" in text_lower:
         signal_type = "ENTRY_SHORT"
-        pattern_name = "UT"
+        pattern_name = "UPTHRUST"
 
     return symbol, signal_type, pattern_name
 
@@ -344,7 +345,6 @@ def webhook():
     pos_info = next((p for p in positions if p["instId"] == inst_id), None)
     current_pos = pos_info["posSide"] if pos_info else None
 
-    # Получаем текущую настроенную маржу
     current_margin = BOT_SETTINGS["default_margin"]
 
     # 1. СИГНАЛ LONG (SPRING)
@@ -357,12 +357,11 @@ def webhook():
                 pnl_sign = "+" if upl >= 0 else ""
                 send_telegram_msg(f"🔄 **Закрыт SHORT по `{inst_id}`** (сигнал Spring).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
 
-        # Открываем LONG автоматически
         send_telegram_msg(f"🟢 **Сигнал SPRING ({symbol})**. Открываем LONG на **${current_margin}**...")
         success, res_msg = execute_okx_trade(symbol, "LONG", current_margin)
         send_telegram_msg(res_msg)
 
-    # 2. СИГНАЛ SHORT (UT)
+    # 2. СИГНАЛ SHORT (UPTHRUST)
     elif signal_type == "ENTRY_SHORT":
         if current_pos == "long":
             upl = pos_info.get("upl", 0.0)
@@ -370,10 +369,9 @@ def webhook():
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
                 pnl_sign = "+" if upl >= 0 else ""
-                send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}`** (сигнал UT).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
+                send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}`** (сигнал Upthrust).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
 
-        # Открываем SHORT автоматически
-        send_telegram_msg(f"🔴 **Сигнал UT ({symbol})**. Открываем SHORT на **${current_margin}**...")
+        send_telegram_msg(f"🔴 **Сигнал UPTHRUST ({symbol})**. Открываем SHORT на **${current_margin}**...")
         success, res_msg = execute_okx_trade(symbol, "SHORT", current_margin)
         send_telegram_msg(res_msg)
 
@@ -384,10 +382,8 @@ def telegram_callback():
     data = request.get_json()
 
     if "message" in data and "text" in data["message"]:
-        chat_id = str(data["message"]["chat"]["id"])
         user_text = data["message"]["text"].strip()
 
-        # Обработка команды /margin <сумма> или просто числа
         if user_text.startswith("/margin") or user_text.startswith("/setmargin"):
             parts = user_text.split()
             if len(parts) > 1:
@@ -410,7 +406,7 @@ def telegram_callback():
 
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Fully Automated Bot is Running!", 200
+    return "OKX Fully Automated Bot (Spring/Upthrust) is Running!", 200
 
 # ИНИЦИАЛИЗАЦИЯ ПЛАНИРОВЩИКА СТРОГО ПО 15M СВЕЧАМ
 scheduler = BackgroundScheduler(daemon=True)
