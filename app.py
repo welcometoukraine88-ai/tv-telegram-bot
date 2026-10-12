@@ -6,7 +6,6 @@ import math
 import base64
 import hmac
 import hashlib
-from datetime import datetime
 from zoneinfo import ZoneInfo
 from flask import Flask, request
 import requests
@@ -14,7 +13,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
-# Токены и ключи из Environment Variables
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -24,19 +22,17 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 
 OKX_BASE_URL = "https://www.okx.com"
 
-# НАСТРОЙКИ ПО УМОЛЧАНИЮ
-RSI_TIMEFRAME = "15m"         # Таймфрейм свечей
-RSI_TRAIL_LONG = 65.0        # Трейлинг для LONG
-RSI_TRAIL_SHORT = 35.0       # Трейлинг для SHORT
-RSI_SL_LONG = 30.0           # Стоп-лосс для LONG
-RSI_SL_SHORT = 70.0          # Стоп-лосс для SHORT
+RSI_TIMEFRAME = "15m"
+RSI_TRAIL_LONG = 65.0
+RSI_TRAIL_SHORT = 35.0
+RSI_SL_LONG = 30.0
+RSI_SL_SHORT = 70.0
 
-# Хранилище настроек в памяти
+# Единое хранилище настроек (по умолчанию 50 USDT, меняется через /margin)
 BOT_SETTINGS = {
     "default_margin": 50.0
 }
 
-# СТАТИСТИКА ДЛЯ ОТЧЕТОВ (за период)
 STATS_DATA = {
     "tp_closed": 0,
     "sl_closed": 0,
@@ -44,13 +40,11 @@ STATS_DATA = {
 }
 
 def get_okx_signature(timestamp, method, request_path, body=""):
-    """Формирует подпись HMAC SHA256 для V5 API OKX"""
     message = timestamp + method + request_path + body
     mac = hmac.new(OKX_SECRET_KEY.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
     return base64.b64encode(mac.digest()).decode('utf-8')
 
 def okx_request(method, request_path, body_data=None):
-    """Универсальная функция отправки запросов к OKX API"""
     body_str = json.dumps(body_data) if body_data else ""
     timestamp = time.strftime('%Y-%m-%dT%H:%M:%S.', time.gmtime()) + f"{int(time.time() * 1000) % 1000:03d}Z"
     signature = get_okx_signature(timestamp, method, request_path, body_str)
@@ -75,7 +69,6 @@ def okx_request(method, request_path, body_data=None):
         return {"code": "-1", "msg": str(e)}
 
 def send_telegram_msg(text):
-    """Вспомогательная функция отправки сообщения в Telegram"""
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
             "chat_id": TELEGRAM_CHAT_ID,
@@ -86,7 +79,6 @@ def send_telegram_msg(text):
         print(f"Ошибка отправки в Telegram: {e}")
 
 def set_okx_leverage(inst_id, leverage):
-    """Устанавливает плечо на OKX"""
     body = {
         "instId": inst_id,
         "lever": str(leverage),
@@ -95,7 +87,6 @@ def set_okx_leverage(inst_id, leverage):
     return okx_request("POST", "/api/v5/account/set-leverage", body)
 
 def get_okx_all_positions():
-    """Получает список всех открытых позиций на OKX"""
     res = okx_request("GET", "/api/v5/account/positions?instType=SWAP")
     positions = []
     if res.get("code") == "0" and res.get("data"):
@@ -113,15 +104,12 @@ def get_okx_all_positions():
     return positions
 
 def close_okx_position(inst_id, pos_side):
-    """Полностью закрывает позицию по рынку (Market Close)"""
     body = {
         "instId": inst_id,
         "mgnMode": "cross",
         "posSide": pos_side
     }
     return okx_request("POST", "/api/v5/trade/close-position", body)
-
-# ================= ТОЧНЫЙ РАСЧЕТ RSI(14) ПО TRADINGVIEW (RMA) =================
 
 def calculate_rsi14_history(inst_id, timeframe=RSI_TIMEFRAME):
     res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit=200")
@@ -183,8 +171,6 @@ def check_and_close_positions_by_rsi():
         if not positions:
             return
 
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Проверка RSI (SL & Trailing)...")
-
         for pos in positions:
             inst_id = pos["instId"]
             pos_side = pos["posSide"]
@@ -232,8 +218,6 @@ def check_and_close_positions_by_rsi():
     except Exception as e:
         print(f"Ошибка проверки RSI: {e}")
 
-# ================= ПЕРИОДИЧЕСКИЙ ОТЧЕТ В ТЕЛЕГРАМ ПО КИЕВСКОМУ ВРЕМЕНИ =================
-
 def send_periodical_report():
     try:
         positions = get_okx_all_positions()
@@ -256,15 +240,12 @@ def send_periodical_report():
 
         send_telegram_msg(report_msg)
 
-        # Сбрасываем счетчики периода
         STATS_DATA["tp_closed"] = 0
         STATS_DATA["sl_closed"] = 0
         STATS_DATA["total_pnl"] = 0.0
 
     except Exception as e:
-        print(f"Ошибка отправки периодического отчета: {e}")
-
-# ================= АВТОМАТИЧЕСКОЕ ИСПОЛНЕНИЕ ОРДЕРА =================
+        print(f"Ошибка отчета: {e}")
 
 def execute_okx_trade(symbol, side_type, margin_usdt):
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
@@ -289,7 +270,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         if ticker_res.get("code") == "0" and ticker_res.get("data"):
             last_price = float(ticker_res["data"][0].get("last", 0.0))
     except Exception as e:
-        print(f"Ошибка получения данных для {inst_id}: {e}")
+        print(f"Ошибка данных {inst_id}: {e}")
 
     if last_price <= 0:
         return False, f"Не удалось получить цену для `{inst_id}`."
@@ -339,8 +320,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         msg = res.get("data", [{}])[0].get("sMsg") or res.get("msg")
         return False, f"Ошибка OKX: {msg}"
 
-# ================= ПАРСЕР АЛЕРТОВ (SPRING / UPTHRUST) =================
-
 def parse_alert(text):
     symbol = "UNKNOWN"
     signal_type = "UNKNOWN"
@@ -375,8 +354,6 @@ def parse_alert(text):
 
     return symbol, signal_type, pattern_name
 
-# ================= WEBHOOKS И TELEGRAM КОМАНДЫ =================
-
 @app.route('/webhook', methods=['POST'])
 def webhook():
     raw_data = request.get_data(as_text=True)
@@ -392,9 +369,9 @@ def webhook():
     pos_info = next((p for p in positions if p["instId"] == inst_id), None)
     current_pos = pos_info["posSide"] if pos_info else None
 
-    current_margin = BOT_SETTINGS["default_margin"]
+    # Читаем актуальную маржу строго из словаря BOT_SETTINGS
+    current_margin = float(BOT_SETTINGS["default_margin"])
 
-    # 1. СИГНАЛ LONG (SPRING)
     if signal_type == "ENTRY_LONG":
         if current_pos == "short":
             upl = pos_info.get("upl", 0.0)
@@ -403,13 +380,11 @@ def webhook():
             if close_res.get("code") == "0":
                 STATS_DATA["total_pnl"] += upl
                 pnl_sign = "+" if upl >= 0 else ""
-                send_telegram_msg(f"🔄 **Закрыт SHORT по `{inst_id}`** (сигнал Spring разворот).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
+                send_telegram_msg(f"🔄 **Закрыт SHORT по `{inst_id}`** (разворот Spring).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
 
-        send_telegram_msg(f"🟢 **Сигнал SPRING ({symbol})**. Открываем LONG на **${current_margin}**...")
         success, res_msg = execute_okx_trade(symbol, "LONG", current_margin)
         send_telegram_msg(res_msg)
 
-    # 2. СИГНАЛ SHORT (UPTHRUST)
     elif signal_type == "ENTRY_SHORT":
         if current_pos == "long":
             upl = pos_info.get("upl", 0.0)
@@ -418,9 +393,8 @@ def webhook():
             if close_res.get("code") == "0":
                 STATS_DATA["total_pnl"] += upl
                 pnl_sign = "+" if upl >= 0 else ""
-                send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}`** (сигнал Upthrust разворот).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
+                send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}`** (разворот Upthrust).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
 
-        send_telegram_msg(f"🔴 **Сигнал UPTHRUST ({symbol})**. Открываем SHORT на **${current_margin}**...")
         success, res_msg = execute_okx_trade(symbol, "SHORT", current_margin)
         send_telegram_msg(res_msg)
 
@@ -440,7 +414,7 @@ def telegram_callback():
                     new_margin = float(parts[1].replace(",", "."))
                     if new_margin > 0:
                         BOT_SETTINGS["default_margin"] = new_margin
-                        send_telegram_msg(f"✅ Маржа по умолчанию изменена на: **${new_margin} USDT**")
+                        send_telegram_msg(f"✅ Маржа на сделку успешно изменена на: **${new_margin} USDT**")
                     else:
                         send_telegram_msg("⚠️ Сумма должна быть больше нуля.")
                 except ValueError:
@@ -455,12 +429,10 @@ def telegram_callback():
 
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Fully Automated Bot with Reports is Running!", 200
+    return "OKX Fully Automated Bot is Running!", 200
 
-# ИНИЦИАЛИЗАЦИЯ ПЛАНИРОВЩИКОВ
 scheduler = BackgroundScheduler(daemon=True)
 
-# 1. Проверка RSI (SL & Trailing) каждые 15 минут строго на 3-й секунде
 scheduler.add_job(
     func=check_and_close_positions_by_rsi,
     trigger='cron',
@@ -469,7 +441,6 @@ scheduler.add_job(
     id='rsi_checker_job'
 )
 
-# 2. Периодический отчет по Киевскому времени в 8, 10, 12, 14, 16, 18, 20, 22 часа
 scheduler.add_job(
     func=send_periodical_report,
     trigger='cron',
