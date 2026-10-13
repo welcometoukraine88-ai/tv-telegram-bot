@@ -1,4 +1,4 @@
-import os
+import osimport os
 import re
 import json
 import time
@@ -32,18 +32,28 @@ RSI_SL_SHORT = 70.0
 STATE_FILE = "bot_state.json"
 
 def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
+    state = {
         "default_margin": 1.0,
         "pending_signals": [],
         "active_trades": {},
         "stats": {"tp_closed": 0, "sl_closed": 0, "total_pnl": 0.0}
     }
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                # Берем маржу из файла только если она там сохранена, иначе оставляем 1.0 или то, что было
+                if "default_margin" in saved:
+                    state["default_margin"] = float(saved["default_margin"])
+                if "pending_signals" in saved:
+                    state["pending_signals"] = saved["pending_signals"]
+                if "active_trades" in saved:
+                    state["active_trades"] = saved["active_trades"]
+                if "stats" in saved:
+                    state["stats"] = saved["stats"]
+        except Exception as e:
+            print(f"Ошибка чтения state-файла: {e}")
+    return state
 
 def save_state(state):
     try:
@@ -302,7 +312,6 @@ def process_signal_execution(symbol, side_type):
 
 def check_and_close_positions_by_rsi():
     try:
-        # 1. Проверяем отложенные сигналы
         still_pending = []
         for sig in BOT_STATE["pending_signals"]:
             success, _ = process_signal_execution(sig["symbol"], sig["side_type"])
@@ -311,7 +320,6 @@ def check_and_close_positions_by_rsi():
         BOT_STATE["pending_signals"] = still_pending
         save_state(BOT_STATE)
 
-        # 2. Проверяем открытые позиции
         positions = get_okx_all_positions()
         if not positions:
             if BOT_STATE["active_trades"]:
@@ -463,7 +471,6 @@ def webhook():
     success, msg = process_signal_execution(symbol, side_type)
     
     if not success:
-        # Добавляем в персистентную очередь отложенных сигналов
         signal_entry = {"symbol": symbol, "side_type": side_type, "pattern": pattern_name}
         if signal_entry not in BOT_STATE["pending_signals"]:
             BOT_STATE["pending_signals"].append(signal_entry)
@@ -491,7 +498,7 @@ def telegram_callback():
                     else:
                         send_telegram_msg("⚠️ Сумма должна быть больше нуля.")
                 except ValueError:
-                    send_telegram_msg("⚠️ Неверный формат. Пример: `/margin 1`")
+                    send_telegram_msg("⚠️ Неверный формат. Пример: `/margin 5`")
             else:
                 send_telegram_msg(f"ℹ️ Текущая маржа на сделку: **${BOT_STATE['default_margin']} USDT**\nДля изменения введите: `/margin <сумма>`")
         
@@ -502,7 +509,7 @@ def telegram_callback():
 
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Smart Bot with Persistent State is Running!", 200
+    return "OKX Smart Bot with Fixed State Loading is Running!", 200
 
 scheduler = BackgroundScheduler(daemon=True)
 
