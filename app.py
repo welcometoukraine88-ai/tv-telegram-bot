@@ -29,7 +29,7 @@ RSI_TRAIL_SHORT = 35.0
 RSI_SL_LONG = 30.0
 RSI_SL_SHORT = 70.0
 
-# Сумма маржи по умолчанию
+# Сумма маржи по умолчанию (1 USDT)
 BOT_SETTINGS = {
     "default_margin": 1.0
 }
@@ -40,10 +40,10 @@ STATS_DATA = {
     "total_pnl": 0.0
 }
 
-# Очередь отложенных входов (когда ждем пересечения RSI 30 / 70)
+# Очередь отложенных входов (ждем нужного RSI)
 PENDING_ENTRY_SIGNALS = []
 
-# Хранилище времени открытия сделок для защиты от СЛ в первые 4 бара (1 час)
+# Метаданные сделок для защиты СЛ на первые 4 бара (1 час)
 ACTIVE_TRADES_META = {}
 
 def get_okx_signature(timestamp, method, request_path, body=""):
@@ -233,7 +233,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     res = okx_request("POST", "/api/v5/trade/order", order_body)
 
     if res.get("code") == "0":
-        # Фиксируем время входа для защиты СЛ на 4 бара (1 час)
         ACTIVE_TRADES_META[inst_id] = {
             "entry_time": time.time(),
             "bars_passed": 0
@@ -242,7 +241,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
             f"🚀 **Авто-ордер открыт!**\n\n"
             f"• Инструмент: `{inst_id}`\n"
             f"• Направление: **{side_type}**\n"
-            f"• Плечо: **~{max_lev}x**\n"
+            f"• Плечо: **{max_lev}x**\n"
             f"• Маржа: **~${round(actual_margin_used, 2)} USDT**"
         )
     else:
@@ -250,7 +249,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         return False, f"Ошибка OKX: {msg}"
 
 def process_signal_execution(symbol, side_type):
-    """Непосредственный вход с проверкой RSI"""
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
     rsi_history = calculate_rsi14_history(inst_id)
@@ -303,16 +301,14 @@ def process_signal_execution(symbol, side_type):
 
 def check_and_close_positions_by_rsi():
     try:
-        # 1. Проверяем отложенные сигналы в очереди входа
         global PENDING_ENTRY_SIGNALS
         still_pending = []
         for sig in PENDING_ENTRY_SIGNALS:
             success, _ = process_signal_execution(sig["symbol"], sig["side_type"])
             if not success:
-                still_pending.append(sig)  # Оставляем ждать дальше
+                still_pending.append(sig)
         PENDING_ENTRY_SIGNALS = still_pending
 
-        # 2. Проверяем открытые позиции на предмет ТП и СЛ
         positions = get_okx_all_positions()
         if not positions:
             ACTIVE_TRADES_META.clear()
@@ -322,14 +318,13 @@ def check_and_close_positions_by_rsi():
             inst_id = pos["instId"]
             pos_side = pos["posSide"]
             
-            # Обновляем счетчик баров после входа (для защиты СЛ в первые 4 бара)
             if inst_id in ACTIVE_TRADES_META:
                 ACTIVE_TRADES_META[inst_id]["bars_passed"] += 1
             else:
-                ACTIVE_TRADES_META[inst_id] = {"bars_passed": 4} # Если бот перезапустился, считаем защиту уже прошедшей
+                ACTIVE_TRADES_META[inst_id] = {"bars_passed": 4}
 
             bars_passed = ACTIVE_TRADES_META[inst_id]["bars_passed"]
-            is_sl_protected = (bars_passed <= 4)  то есть первые 4 бара (1 час) СЛ заблокирован
+            is_sl_protected = (bars_passed <= 4)
 
             rsi_history = calculate_rsi14_history(inst_id)
             if not rsi_history or len(rsi_history) < 2:
@@ -344,11 +339,8 @@ def check_and_close_positions_by_rsi():
             pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
             if pos_side == "long":
-                # СТОП-ЛОСС (защищен в течение первых 4 баров)
                 if curr_rsi < RSI_SL_LONG:
-                    if is_sl_protected:
-                        print(f"[{inst_id}] СЛ пробит (RSI < 30), но действует защита первого часа ({bars_passed}/4 бара).")
-                    else:
+                    if not is_sl_protected:
                         close_res = close_okx_position(inst_id, "long")
                         if close_res.get("code") == "0":
                             STATS_DATA["sl_closed"] += 1
@@ -356,7 +348,6 @@ def check_and_close_positions_by_rsi():
                             send_telegram_msg(f"🛑 **СТОП-ЛОСС LONG по `{inst_id}`**\n• RSI < 30: **{curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
                             ACTIVE_TRADES_META.pop(inst_id, None)
                 
-                # ТЕЙК-ПРОФИТ (Трейлинг) - работает без ограничений с первой свечи
                 elif curr_rsi >= RSI_TRAIL_LONG and prev_rsi > curr_rsi:
                     close_res = close_okx_position(inst_id, "long")
                     if close_res.get("code") == "0":
@@ -366,11 +357,8 @@ def check_and_close_positions_by_rsi():
                         ACTIVE_TRADES_META.pop(inst_id, None)
 
             elif pos_side == "short":
-                # СТОП-ЛОСС (защищен в течение первых 4 баров)
                 if curr_rsi > RSI_SL_SHORT:
-                    if is_sl_protected:
-                        print(f"[{inst_id}] СЛ пробит (RSI > 70), но действует защита первого часа ({bars_passed}/4 бара).")
-                    else:
+                    if not is_sl_protected:
                         close_res = close_okx_position(inst_id, "short")
                         if close_res.get("code") == "0":
                             STATS_DATA["sl_closed"] += 1
@@ -378,7 +366,6 @@ def check_and_close_positions_by_rsi():
                             send_telegram_msg(f"🛑 **СТОП-ЛОСС SHORT по `{inst_id}`**\n• RSI > 70: **{curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
                             ACTIVE_TRADES_META.pop(inst_id, None)
 
-                # ТЕЙК-ПРОФИТ (Трейлинг) - работает без ограничений с первой свечи
                 elif curr_rsi <= RSI_TRAIL_SHORT and prev_rsi < curr_rsi:
                     close_res = close_okx_position(inst_id, "short")
                     if close_res.get("code") == "0":
@@ -463,10 +450,8 @@ def webhook():
 
     side_type = "LONG" if signal_type == "ENTRY_LONG" else "SHORT"
 
-    # Сразу пытаемся открыть сделку по условиям RSI. Если RSI не подходит, кидаем в очередь ожидания.
     success, msg = process_signal_execution(symbol, side_type)
     if not success:
-        # Добавляем в очередь ожидания пересечения RSI
         PENDING_ENTRY_SIGNALS.append({"symbol": symbol, "side_type": side_type})
         send_telegram_msg(f"⏳ **Сигнал {pattern_name} ({symbol}) получен**. {msg}")
 
