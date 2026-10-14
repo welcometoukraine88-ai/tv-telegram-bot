@@ -386,4 +386,63 @@ def telegram_callback():
                 })
             return "OK", 200
 
-    # 2. Обычный текстовый ввод (
+    # 2. Обычный текстовый ввод (сумма маржи)
+    if "message" in data and "text" in data["message"]:
+        msg = data["message"]
+        chat_id = msg["chat"]["id"]
+        user_text = msg["text"].strip()
+
+        if chat_id in PENDING_MARGIN_INPUT:
+            try:
+                margin_usdt = float(user_text.replace(",", "."))
+                if margin_usdt > 0:
+                    sig = PENDING_MARGIN_INPUT.pop(chat_id)
+                    symbol = sig["symbol"]
+                    side = sig["side"]
+                    inst_id = sig["inst_id"]
+                    msg_id = sig["message_id"]
+
+                    positions = get_okx_all_positions()
+                    pos_info = next((p for p in positions if p["instId"] == inst_id), None)
+                    current_pos = pos_info["posSide"] if pos_info else None
+                    upl = pos_info.get("upl", 0.0) if pos_info else 0.0
+                    upl_ratio = pos_info.get("uplRatio", 0.0) if pos_info else 0.0
+                    pnl_sign = "+" if upl >= 0 else ""
+                    pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+
+                    if side == "LONG" and current_pos == "short":
+                        close_res = close_okx_position(inst_id, "short")
+                        if close_res.get("code") == "0":
+                            send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт SHORT по `{inst_id}`\n• PnL: `{pnl_str}`")
+                    elif side == "SHORT" and current_pos == "long":
+                        close_res = close_okx_position(inst_id, "long")
+                        if close_res.get("code") == "0":
+                            send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт LONG по `{inst_id}`\n• PnL: `{pnl_str}`")
+
+                    success, err_msg = execute_okx_trade(symbol, side, margin_usdt)
+                    emoji = "🚀" if side == "LONG" else "🔻"
+                    
+                    if success:
+                        send_telegram_msg(
+                            f"{emoji} *ОРДЕР УСПЕШНО ОТКРЫТ*\n"
+                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"• *Инструмент:* `{inst_id}`\n"
+                            f"• *Тип:* `{side}`\n"
+                            f"• *Маржа:* `${margin_usdt} USDT`\n"
+                            f"• *Плечо:* `Макс (авто)`"
+                        )
+                    else:
+                        send_telegram_msg(f"⚠️ *Ошибка открытия `{inst_id}`*\n• Причина: `{err_msg}`")
+                    return "OK", 200
+            except ValueError:
+                send_telegram_msg("⚠️ Пожалуйста, введите корректное число для маржи (например: `10` или `25.5`)")
+
+    return "OK", 200
+
+@app.route('/', methods=['GET'])
+def index():
+    return "OKX Smart Bot is Running!", 200
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
