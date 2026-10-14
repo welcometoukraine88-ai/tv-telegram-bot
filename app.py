@@ -206,14 +206,24 @@ def parse_alert(text):
 
     text_str = text if isinstance(text, str) else json.dumps(text)
 
-    try:
-        data = json.loads(text_str)
-        if isinstance(data, dict):
-            raw_sym = data.get("instrument") or data.get("symbol") or data.get("ticker") or ""
-            if raw_sym:
-                symbol = raw_sym.split(":")[-1].strip() if ":" in raw_sym else raw_sym.strip()
-    except Exception:
-        pass
+    # 1. Извлекаем тикер, если он идет в начале через двоеточие (например, CASHCATUSDT.P: ...)
+    if ":" in text_str:
+        parts = text_str.split(":", 1)
+        potential_symbol = parts[0].strip().replace('"', '').replace("'", "")
+        if len(potential_symbol) > 2 and ("USDT" in potential_symbol.upper() or ".P" in potential_symbol.upper()):
+            symbol = potential_symbol.upper()
+            text_str = parts[1]
+
+    # 2. Страховка по старому формату JSON или Regex
+    if symbol == "UNKNOWN":
+        try:
+            data = json.loads(text_str)
+            if isinstance(data, dict):
+                raw_sym = data.get("instrument") or data.get("symbol") or data.get("ticker") or ""
+                if raw_sym:
+                    symbol = raw_sym.split(":")[-1].strip() if ":" in raw_sym else raw_sym.strip()
+        except Exception:
+            pass
 
     if symbol == "UNKNOWN":
         match = re.search(r'([A-Za-z0-9_]+(?:USDT|\.p|\.P))', text_str)
@@ -247,24 +257,16 @@ def webhook():
     print(f"DEBUG TRADINGVIEW DATA: {raw_data}")
     print(f"DEBUG HEADERS: {dict(request.headers)}")
     
-    # 1. Забираем тикер из параметров URL (?ticker={{ticker}})
-    url_ticker = request.args.get('ticker', '').strip()
-    if url_ticker and "{{" not in url_ticker:
-        symbol = url_ticker.upper()
-    else:
-        symbol = "UNKNOWN"
-    
-    # 2. Определяем тип сигнала из текста
-    _, signal_type, pattern_name = parse_alert(raw_data)
+    # 1. Парсим тикер и сигнал из текста
+    symbol, signal_type, pattern_name = parse_alert(raw_data)
 
-    # Страховка: если в URL тикера не оказалось, пробуем вытащить старым методом
+    # 2. Страховка через URL-параметр, если передан ?ticker=
     if symbol == "UNKNOWN":
-        symbol_parsed, signal_type_parsed, pattern_name = parse_alert(raw_data)
-        symbol = symbol_parsed
-        if signal_type == "UNKNOWN":
-            signal_type = signal_type_parsed
+        url_ticker = request.args.get('ticker', '').strip()
+        if url_ticker and "{{" not in url_ticker:
+            symbol = url_ticker.upper()
 
-    # Если тикер или сигнал все еще не распознаны — выходим
+    # Если тикер или сигнал не распознаны — выходим
     if not symbol or symbol == "UNKNOWN" or signal_type == "UNKNOWN":
         return "OK", 200
 
