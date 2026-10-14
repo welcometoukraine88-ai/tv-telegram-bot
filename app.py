@@ -29,7 +29,6 @@ RSI_TRAIL_SHORT = 35.0
 RSI_SL_LONG = 30.0
 RSI_SL_SHORT = 70.0
 
-# Глобальное хранилище состояния прямо в памяти процесса
 BOT_STATE = {
     "default_margin": 1.0,
     "pending_signals": [],
@@ -448,6 +447,7 @@ def webhook():
 @app.route('/telegram-callback', methods=['POST'])
 def telegram_callback():
     data = request.get_json()
+    print(f"DEBUG TELEGRAM DATA: {data}") # Печатаем пришедший JSON в логи Render
 
     if data and "message" in data and "text" in data["message"]:
         user_text = data["message"]["text"].strip()
