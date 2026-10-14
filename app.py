@@ -31,7 +31,7 @@ RSI_SL_SHORT = 70.0
 
 # Сумма маржи по умолчанию (1 USDT)
 BOT_SETTINGS = {
-    "default_margin": 1.0
+    "default_margin": float(os.environ.get("DEFAULT_MARGIN", "1.0"))
 }
 
 STATS_DATA = {
