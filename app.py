@@ -22,7 +22,6 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 OKX_BASE_URL = "https://www.okx.com"
 
 RSI_TIMEFRAME = "15m"
-# Уровни выхода по RSI14 (65 / 35)
 RSI_EXIT_LONG = 65.0
 RSI_EXIT_SHORT = 35.0
 
@@ -207,7 +206,6 @@ def parse_alert(text):
 
     text_str = text if isinstance(text, str) else json.dumps(text)
 
-    # 1. Пытаемся вытащить через JSON
     try:
         data = json.loads(text_str)
         if isinstance(data, dict):
@@ -217,7 +215,6 @@ def parse_alert(text):
     except Exception:
         pass
 
-    # 2. Усиленная регулярка: ищем любые тикеры (включая регистронезависимость)
     if symbol == "UNKNOWN":
         match = re.search(r'([A-Za-z0-9_]+(?:USDT|\.p|\.P))', text_str)
         if match:
@@ -227,7 +224,6 @@ def parse_alert(text):
 
     text_lower = text_str.lower()
     
-    # 3. Распознавание триггеров
     if "buy level retest" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "BUY_RETEST"
@@ -243,14 +239,22 @@ def parse_alert(text):
 
     return symbol, signal_type, pattern_name
 
-@app.route('/webhook', methods=['POST'])
+@app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
     global LAST_SIGNAL
+    
     raw_data = request.get_data(as_text=True)
+    print("=== ВХОДЯЩИЙ ВЕБХУК ===")
+    print(raw_data)
+    
+    send_telegram_msg(f"📥 **Получен вебхук от TV!**\nТекст: `{raw_data[:100]}`")
+
     symbol, signal_type, pattern_name = parse_alert(raw_data)
+    print(f"Распознано: символ={symbol}, тип={signal_type}")
 
     if symbol == "UNKNOWN" or signal_type == "UNKNOWN":
-        return "Ignored", 200
+        send_telegram_msg("⚠️ Вебхук пришел, но тикер или тип сигнала не распознаны!")
+        return "OK", 200
 
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
