@@ -206,6 +206,7 @@ def parse_alert(text):
 
     text_str = text if isinstance(text, str) else json.dumps(text)
 
+    # 1. Пытаемся найти тикер в JSON
     try:
         data = json.loads(text_str)
         if isinstance(data, dict):
@@ -215,6 +216,7 @@ def parse_alert(text):
     except Exception:
         pass
 
+    # 2. Ищем тикер через регулярку в тексте
     if symbol == "UNKNOWN":
         match = re.search(r'([A-Za-z0-9_]+(?:USDT|\.p|\.P))', text_str)
         if match:
@@ -224,6 +226,7 @@ def parse_alert(text):
 
     text_lower = text_str.lower()
     
+    # 3. Распознавание триггеров
     if "buy level retest" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "BUY_RETEST"
