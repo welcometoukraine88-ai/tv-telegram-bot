@@ -25,9 +25,8 @@ RSI_TIMEFRAME = "15m"
 RSI_EXIT_LONG = 70.0
 RSI_EXIT_SHORT = 30.0
 
-BOT_SETTINGS = {
-    "default_margin": float(os.environ.get("DEFAULT_MARGIN", "1.0"))
-}
+# Глобальная переменная для ожидания ввода маржи по последнему сигналу
+LAST_SIGNAL = None
 
 def get_okx_signature(timestamp, method, request_path, body=""):
     message = timestamp + method + request_path + body
@@ -171,7 +170,6 @@ def parse_alert(text):
 
     text_str = text if isinstance(text, str) else json.dumps(text)
 
-    # 1. Пытаемся вытащить через JSON
     try:
         data = json.loads(text_str)
         if isinstance(data, dict):
@@ -181,7 +179,6 @@ def parse_alert(text):
     except Exception:
         pass
 
-    # 2. Если в JSON пусто, ищем тикер в тексте (например, MSFTUSDT.P, SOONUSDT.P)
     if symbol == "UNKNOWN":
         match = re.search(r'([A-Z0-9]+(?:USDT|\.P))', text_str)
         if match:
@@ -191,7 +188,6 @@ def parse_alert(text):
 
     text_lower = text_str.lower()
     
-    # 3. Точные триггеры входа и стоп-лосса
     if "buy level retest triggered" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "BUY_RETEST"
@@ -209,6 +205,7 @@ def parse_alert(text):
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    global LAST_SIGNAL
     raw_data = request.get_data(as_text=True)
     symbol, signal_type, pattern_name = parse_alert(raw_data)
 
@@ -217,7 +214,6 @@ def webhook():
 
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
-    current_margin = float(BOT_SETTINGS["default_margin"])
 
     positions = get_okx_all_positions()
     pos_info = next((p for p in positions if p["instId"] == inst_id), None)
@@ -227,7 +223,7 @@ def webhook():
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-    # Стоп-лосс по Range Breakout
+    # Стоп-лосс по Range Breakout срабатывает автоматически
     if signal_type == "BREAKOUT_DOWN" and current_pos == "long":
         close_res = close_okx_position(inst_id, "long")
         if close_res.get("code") == "0":
@@ -240,36 +236,20 @@ def webhook():
             send_telegram_msg(f"🛑 **СТОП-ЛОСС (Breakout UP) SHORT по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
         return "OK", 200
 
-    # Вход по Buy level retest triggered (Лонг)
+    # Обработка входов: запоминаем сигнал и запрашиваем размер маржи у пользователя
     if signal_type == "ENTRY_LONG":
-        if current_pos == "short":
-            close_res = close_okx_position(inst_id, "short")
-            if close_res.get("code") == "0":
-                send_telegram_msg(f"🔄 **Закрыт SHORT по `{inst_id}` (Разворот в Лонг)**\n💰 **PnL:** `{pnl_str}`")
+        LAST_SIGNAL = {"symbol": symbol, "side": "LONG", "inst_id": inst_id, "current_pos": current_pos, "pnl_str": pnl_str}
+        send_telegram_msg(f"🔔 **Поступил сигнал на LONG!**\n• Инструмент: `{inst_id}`\n\n💬 **Введите размер позиции в USDT** (отправьте число в чат):")
 
-        success, err_msg = execute_okx_trade(symbol, "LONG", current_margin)
-        if success:
-            send_telegram_msg(f"🚀 **LONG открыт (OKX)**\n• Ticker: `{inst_id}`\n• Маржа: `${current_margin} USDT`")
-        else:
-            send_telegram_msg(f"⚠️ **Ошибка открытия LONG `{inst_id}`**: {err_msg}")
-
-    # Вход по Sell level retest triggered (Шорт)
     elif signal_type == "ENTRY_SHORT":
-        if current_pos == "long":
-            close_res = close_okx_position(inst_id, "long")
-            if close_res.get("code") == "0":
-                send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}` (Разворот в Шорт)**\n💰 **PnL:** `{pnl_str}`")
-
-        success, err_msg = execute_okx_trade(symbol, "SHORT", current_margin)
-        if success:
-            send_telegram_msg(f"🔻 **SHORT открыт (OKX)**\n• Ticker: `{inst_id}`\n• Маржа: `${current_margin} USDT`")
-        else:
-            send_telegram_msg(f"⚠️ **Ошибка открытия SHORT `{inst_id}`**: {err_msg}")
+        LAST_SIGNAL = {"symbol": symbol, "side": "SHORT", "inst_id": inst_id, "current_pos": current_pos, "pnl_str": pnl_str}
+        send_telegram_msg(f"🔔 **Поступил сигнал на SHORT!**\n• Инструмент: `{inst_id}`\n\n💬 **Введите размер позиции в USDT** (отправьте число в чат):")
 
     return "OK", 200
 
 @app.route('/telegram-callback', methods=['POST'])
 def telegram_callback():
+    global LAST_SIGNAL
     data = request.get_json(silent=True)
     if not data:
         return "OK", 200
@@ -277,23 +257,44 @@ def telegram_callback():
     if "message" in data and "text" in data["message"]:
         user_text = data["message"]["text"].strip()
 
-        if user_text.startswith("/margin") or user_text.startswith("/setmargin"):
-            parts = user_text.split()
-            if len(parts) > 1:
-                try:
-                    new_margin = float(parts[1].replace(",", "."))
-                    if new_margin > 0:
-                        BOT_SETTINGS["default_margin"] = new_margin
-                        send_telegram_msg(f"✅ Маржа на сделку успешно изменена на: **${new_margin} USDT**")
+        # Проверяем, не вводит ли пользователь сумму для ожидающего сигнала
+        if LAST_SIGNAL is not None:
+            try:
+                margin_usdt = float(user_text.replace(",", "."))
+                if margin_usdt > 0:
+                    sig = LAST_SIGNAL
+                    LAST_SIGNAL = None  брос ожидания
+
+                    symbol = sig["symbol"]
+                    side = sig["side"]
+                    inst_id = sig["inst_id"]
+                    current_pos = sig["current_pos"]
+                    pnl_str = sig["pnl_str"]
+
+                    # Закрываем противоположную позицию при развороте
+                    if side == "LONG" and current_pos == "short":
+                        close_res = close_okx_position(inst_id, "short")
+                        if close_res.get("code") == "0":
+                            send_telegram_msg(f"🔄 **Закрыт SHORT по `{inst_id}` (Разворот в Лонг)**\n💰 **PnL:** `{pnl_str}`")
+                    elif side == "SHORT" and current_pos == "long":
+                        close_res = close_okx_position(inst_id, "long")
+                        if close_res.get("code") == "0":
+                            send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}` (Разворот в Шорт)**\n💰 **PnL:** `{pnl_str}`")
+
+                    # Открываем сделку на введенную сумму
+                    success, err_msg = execute_okx_trade(symbol, side, margin_usdt)
+                    if success:
+                        emoji = "🚀" if side == "LONG" else "🔻"
+                        send_telegram_msg(f"{emoji} **{side} открыт на OKX**\n• Ticker: `{inst_id}`\n• Маржа: **${margin_usdt} USDT**")
                     else:
-                        send_telegram_msg("⚠️ Сумма должна быть больше нуля.")
-                except ValueError:
-                    send_telegram_msg("⚠️ Неверный формат. Пример: `/margin 1`")
-            else:
-                send_telegram_msg(f"ℹ️ Текущая маржа на сделку: **${BOT_SETTINGS['default_margin']} USDT**\nДля изменения введите: `/margin <сумма>`")
-        
-        elif user_text.startswith("/settings") or user_text.startswith("/status"):
-            send_telegram_msg(f"⚙️ **Текущие настройки бота:**\n• Маржа на сделку: **${BOT_SETTINGS['default_margin']} USDT**\n• Плечо: **Максимальное (авто)**")
+                        send_telegram_msg(f"⚠️ **Ошибка открытия `{inst_id}`**: {err_msg}")
+                    return "OK", 200
+            except ValueError:
+                pass  # Если введено не число, идем дальше к обычным командам
+
+        # Обычные команды
+        if user_text.startswith("/status") or user_text.startswith("/settings"):
+            send_telegram_msg(f"⚙️ **Статус бота:**\n• Режим: **Интерактивный ввод маржи**\n• Плечо: **Максимальное (авто)**")
 
     return "OK", 200
 
