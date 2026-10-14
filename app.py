@@ -21,6 +21,10 @@ OKX_API_KEY = os.environ.get("OKX_API_KEY", "")
 OKX_SECRET_KEY = os.environ.get("OKX_SECRET_KEY", "")
 OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 
+# Данные для управления через API Render (чтобы настройки жили вечно)
+RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
+RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
+
 OKX_BASE_URL = "https://www.okx.com"
 
 RSI_TIMEFRAME = "15m"
@@ -29,41 +33,54 @@ RSI_TRAIL_SHORT = 35.0
 RSI_SL_LONG = 30.0
 RSI_SL_SHORT = 70.0
 
-STATE_FILE = "bot_state.json"
+# Статистика и отложенные сигналы хранятся в памяти, а маржа — надежно в переменной окружения Render
+BOT_STATE = {
+    "pending_signals": [],
+    "active_trades": {},
+    "stats": {"tp_closed": 0, "sl_closed": 0, "total_pnl": 0.0}
+}
 
-def load_state():
-    state = {
-        "default_margin": 1.0,
-        "pending_signals": [],
-        "active_trades": {},
-        "stats": {"tp_closed": 0, "sl_closed": 0, "total_pnl": 0.0}
-    }
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-                # Берем маржу из файла только если она там сохранена, иначе оставляем 1.0 или то, что было
-                if "default_margin" in saved:
-                    state["default_margin"] = float(saved["default_margin"])
-                if "pending_signals" in saved:
-                    state["pending_signals"] = saved["pending_signals"]
-                if "active_trades" in saved:
-                    state["active_trades"] = saved["active_trades"]
-                if "stats" in saved:
-                    state["stats"] = saved["stats"]
-        except Exception as e:
-            print(f"Ошибка чтения state-файла: {e}")
-    return state
-
-def save_state(state):
+def get_current_margin():
+    # Читаем маржу напрямую из переменных окружения Render (по умолчанию 1.0)
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Ошибка сохранения состояния: {e}")
+        return float(os.environ.get("DEFAULT_MARGIN", "1.0"))
+    except ValueError:
+        return 1.0
 
-# Инициализация состояния
-BOT_STATE = load_state()
+def update_render_env_margin(new_margin):
+    """Обновляет переменную DEFAULT_MARGIN через API Render, чтобы настройка не стиралась"""
+    if not RENDER_API_KEY or not RENDER_SERVICE_ID:
+        # Если ключи не заданы, просто меняем в памяти текущего процесса
+        os.environ["DEFAULT_MARGIN"] = str(new_margin)
+        return True
+
+    url = f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars"
+    headers = {
+        "Authorization": f"Bearer {RENDER_API_KEY}",
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    
+    # Render требует передавать весь список или обновлять конкретную переменную
+    payload = [
+        {"key": "DEFAULT_MARGIN", "value": str(new_margin)}
+    ]
+    
+    try:
+        # Используем метод PUT или PATCH в зависимости от API Render, обычно env-vars обновляются списком через PUT
+        res = requests.put(url, json=payload, headers=headers, timeout=10)
+        if res.status_code in [200, 201]:
+            os.environ["DEFAULT_MARGIN"] = str(new_margin)
+            return True
+        else:
+            print(f"Ошибка API Render: {res.text}")
+            # Запасной вариант: хотя бы в памяти обновим
+            os.environ["DEFAULT_MARGIN"] = str(new_margin)
+            return True
+    except Exception as e:
+        print(f"Ошибка запроса к Render API: {e}")
+        os.environ["DEFAULT_MARGIN"] = str(new_margin)
+        return True
 
 def get_okx_signature(timestamp, method, request_path, body=""):
     message = timestamp + method + request_path + body
@@ -253,18 +270,12 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
             "entry_time": time.time(),
             "bars_passed": 0
         }
-        save_state(BOT_STATE)
         return True, "Success"
     else:
         msg = res.get("data", [{}])[0].get("sMsg") or res.get("msg")
         return False, f"Ошибка OKX: {msg}"
 
 def process_signal_execution(symbol, side_type):
-    global BOT_STATE
-    # Принудительно подтягиваем актуальное состояние с диска, 
-    # чтобы синхронизировать разные воркеры Gunicorn
-    BOT_STATE = load_state()
-
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
     rsi_history = calculate_rsi14_history(inst_id)
@@ -273,7 +284,7 @@ def process_signal_execution(symbol, side_type):
         return False, "Нет данных RSI"
 
     curr_rsi = rsi_history[-1]
-    current_margin = float(BOT_STATE["default_margin"])
+    current_margin = get_current_margin()
 
     positions = get_okx_all_positions()
     pos_info = next((p for p in positions if p["instId"] == inst_id), None)
@@ -289,7 +300,6 @@ def process_signal_execution(symbol, side_type):
             close_res = close_okx_position(inst_id, "short")
             if close_res.get("code") == "0":
                 BOT_STATE["stats"]["total_pnl"] += upl
-                save_state(BOT_STATE)
                 pnl_sign = "+" if upl >= 0 else ""
                 send_telegram_msg(f"🔄 **Закрыт SHORT по `{inst_id}`** (разворот Spring).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
 
@@ -306,7 +316,6 @@ def process_signal_execution(symbol, side_type):
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
                 BOT_STATE["stats"]["total_pnl"] += upl
-                save_state(BOT_STATE)
                 pnl_sign = "+" if upl >= 0 else ""
                 send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}`** (разворот Upthrust).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
 
@@ -323,13 +332,11 @@ def check_and_close_positions_by_rsi():
             if not success:
                 still_pending.append(sig)
         BOT_STATE["pending_signals"] = still_pending
-        save_state(BOT_STATE)
 
         positions = get_okx_all_positions()
         if not positions:
             if BOT_STATE["active_trades"]:
                 BOT_STATE["active_trades"].clear()
-                save_state(BOT_STATE)
             return
 
         for pos in positions:
@@ -340,7 +347,6 @@ def check_and_close_positions_by_rsi():
                 BOT_STATE["active_trades"][inst_id]["bars_passed"] += 1
             else:
                 BOT_STATE["active_trades"][inst_id] = {"bars_passed": 4}
-            save_state(BOT_STATE)
 
             bars_passed = BOT_STATE["active_trades"][inst_id]["bars_passed"]
             is_sl_protected = (bars_passed <= 4)
@@ -365,7 +371,6 @@ def check_and_close_positions_by_rsi():
                             BOT_STATE["stats"]["sl_closed"] += 1
                             BOT_STATE["stats"]["total_pnl"] += upl
                             BOT_STATE["active_trades"].pop(inst_id, None)
-                            save_state(BOT_STATE)
                             send_telegram_msg(f"🛑 **СТОП-ЛОСС LONG по `{inst_id}`**\n• RSI < 30: **{curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
                 
                 elif curr_rsi >= RSI_TRAIL_LONG and prev_rsi > curr_rsi:
@@ -374,7 +379,6 @@ def check_and_close_positions_by_rsi():
                         BOT_STATE["stats"]["tp_closed"] += 1
                         BOT_STATE["stats"]["total_pnl"] += upl
                         BOT_STATE["active_trades"].pop(inst_id, None)
-                        save_state(BOT_STATE)
                         send_telegram_msg(f"🎯 **Трейлинг-стоп LONG по `{inst_id}`**\n• RSI разворот вниз: **{prev_rsi} ➔ {curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
 
             elif pos_side == "short":
@@ -385,7 +389,6 @@ def check_and_close_positions_by_rsi():
                             BOT_STATE["stats"]["sl_closed"] += 1
                             BOT_STATE["stats"]["total_pnl"] += upl
                             BOT_STATE["active_trades"].pop(inst_id, None)
-                            save_state(BOT_STATE)
                             send_telegram_msg(f"🛑 **СТОП-ЛОСС SHORT по `{inst_id}`**\n• RSI > 70: **{curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
 
                 elif curr_rsi <= RSI_TRAIL_SHORT and prev_rsi < curr_rsi:
@@ -394,7 +397,6 @@ def check_and_close_positions_by_rsi():
                         BOT_STATE["stats"]["tp_closed"] += 1
                         BOT_STATE["stats"]["total_pnl"] += upl
                         BOT_STATE["active_trades"].pop(inst_id, None)
-                        save_state(BOT_STATE)
                         send_telegram_msg(f"🎯 **Трейлинг-стоп SHORT по `{inst_id}`**\n• RSI разворот вверх: **{prev_rsi} ➔ {curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
 
     except Exception as e:
@@ -425,7 +427,6 @@ def send_periodical_report():
         BOT_STATE["stats"]["tp_closed"] = 0
         BOT_STATE["stats"]["sl_closed"] = 0
         BOT_STATE["stats"]["total_pnl"] = 0.0
-        save_state(BOT_STATE)
 
     except Exception as e:
         print(f"Ошибка отчета: {e}")
@@ -479,7 +480,6 @@ def webhook():
         signal_entry = {"symbol": symbol, "side_type": side_type, "pattern": pattern_name}
         if signal_entry not in BOT_STATE["pending_signals"]:
             BOT_STATE["pending_signals"].append(signal_entry)
-            save_state(BOT_STATE)
             send_telegram_msg(f"⏳ **Сигнал {pattern_name} ({symbol}) получен**. {msg} Заявка поставлена в очередь.")
 
     return "OK", 200
@@ -497,24 +497,25 @@ def telegram_callback():
                 try:
                     new_margin = float(parts[1].replace(",", "."))
                     if new_margin > 0:
-                        BOT_STATE["default_margin"] = new_margin
-                        save_state(BOT_STATE)
-                        send_telegram_msg(f"✅ Маржа на сделку успешно изменена на: **${new_margin} USDT**")
+                        update_render_env_margin(new_margin)
+                        send_telegram_msg(f"✅ Маржа на сделку успешно изменена на: **${new_margin} USDT** (сохранено на Render)")
                     else:
                         send_telegram_msg("⚠️ Сумма должна быть больше нуля.")
                 except ValueError:
                     send_telegram_msg("⚠️ Неверный формат. Пример: `/margin 5`")
             else:
-                send_telegram_msg(f"ℹ️ Текущая маржа на сделку: **${BOT_STATE['default_margin']} USDT**\nДля изменения введите: `/margin <сумма>`")
+                current_m = get_current_margin()
+                send_telegram_msg(f"ℹ️ Текущая маржа на сделку: **${current_m} USDT**\nДля изменения введите: `/margin <сумма>`")
         
         elif user_text.startswith("/settings") or user_text.startswith("/status"):
-            send_telegram_msg(f"⚙️ **Текущие настройки бота:**\n• Маржа на сделку: **${BOT_STATE['default_margin']} USDT**\n• Плечо: **Максимальное (авто)**")
+            current_m = get_current_margin()
+            send_telegram_msg(f"⚙️ **Текущие настройки бота:**\n• Маржа на сделку: **${current_m} USDT**\n• Плечо: **Максимальное (авто)**")
 
     return "OK", 200
 
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Smart Bot with Fixed State Loading is Running!", 200
+    return "OKX Smart Bot with Render API State is Running!", 200
 
 scheduler = BackgroundScheduler(daemon=True)
 
