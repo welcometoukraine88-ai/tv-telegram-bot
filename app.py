@@ -100,6 +100,42 @@ def close_okx_position(inst_id, pos_side):
     }
     return okx_request("POST", "/api/v5/trade/close-position", body)
 
+def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
+    res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit=100")
+    if res.get("code") != "0" or not res.get("data"):
+        return None
+
+    raw_candles = res["data"]
+    if len(raw_candles) < 30:
+        return None
+
+    candles = list(reversed(raw_candles))
+    closes = [float(c[4]) for c in candles]
+
+    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(c, 0.0) for c in changes]
+    losses = [abs(min(c, 0.0)) for c in changes]
+
+    length = 14
+    if len(gains) < length:
+        return None
+
+    avg_gain = sum(gains[:length]) / length
+    avg_loss = sum(losses[:length]) / length
+
+    for i in range(length, len(gains)):
+        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
+        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
+
+    if avg_loss == 0:
+        return 100.0
+    if avg_gain == 0:
+        return 0.0
+
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return round(rsi, 2)
+
 def execute_okx_trade(symbol, side_type, margin_usdt):
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
@@ -223,6 +259,22 @@ def webhook():
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
+    # 1. Проверяем выход по RSI-14 (ужесточено до 70 / 30)
+    current_rsi = calculate_rsi14(inst_id)
+    if current_rsi is not None:
+        if current_pos == "long" and current_rsi >= RSI_EXIT_LONG:
+            close_res = close_okx_position(inst_id, "long")
+            if close_res.get("code") == "0":
+                send_telegram_msg(f"🎯 **ТП / ТЕЙК (RSI {current_rsi} >= {RSI_EXIT_LONG}) LONG по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
+            return "OK", 200
+
+        if current_pos == "short" and current_rsi <= RSI_EXIT_SHORT:
+            close_res = close_okx_position(inst_id, "short")
+            if close_res.get("code") == "0":
+                send_telegram_msg(f"🎯 **ТП / ТЕЙК (RSI {current_rsi} <= {RSI_EXIT_SHORT}) SHORT по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
+            return "OK", 200
+
+    # 2. Стоп-лосс по Range Breakout
     if signal_type == "BREAKOUT_DOWN" and current_pos == "long":
         close_res = close_okx_position(inst_id, "long")
         if close_res.get("code") == "0":
@@ -235,6 +287,7 @@ def webhook():
             send_telegram_msg(f"🛑 **СТОП-ЛОСС (Breakout UP) SHORT по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
         return "OK", 200
 
+    # 3. Входы по ретесту уровней (запрос маржи)
     if signal_type == "ENTRY_LONG":
         LAST_SIGNAL = {"symbol": symbol, "side": "LONG", "inst_id": inst_id, "current_pos": current_pos, "pnl_str": pnl_str}
         send_telegram_msg(f"🔔 **Поступил сигнал на LONG!**\n• Инструмент: `{inst_id}`\n\n💬 **Введите размер позиции в USDT** (отправьте число в чат):")
@@ -288,7 +341,7 @@ def telegram_callback():
                 pass
 
         if user_text.startswith("/status") or user_text.startswith("/settings"):
-            send_telegram_msg(f"⚙️ **Статус бота:**\n• Режим: **Интерактивный ввод маржи**\n• Плечо: **Максимальное (авто)**")
+            send_telegram_msg(f"⚙️ **Статус бота:**\n• Режим: **Интерактивный ввод маржи**\n• Выход по RSI-14: **70 (Long) / 30 (Short)**\n• Плечо: **Максимальное (авто)**")
 
     return "OK", 200
 
