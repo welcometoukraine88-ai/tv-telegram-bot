@@ -244,6 +244,9 @@ def webhook():
     global LAST_SIGNAL
     
     raw_data = request.get_data(as_text=True)
+    print(f"DEBUG TRADINGVIEW DATA: {raw_data}") # <--- Добавь эту строчку
+    print(f"DEBUG HEADERS: {dict(request.headers)}") # <--- И эту тоже
+    
     symbol, signal_type, pattern_name = parse_alert(raw_data)
 
     # Если тикер не найден в тексте, попробуем поискать его в параметрах URL или заголовках на всякий случай
