@@ -22,8 +22,9 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 OKX_BASE_URL = "https://www.okx.com"
 
 RSI_TIMEFRAME = "15m"
-RSI_EXIT_LONG = 70.0
-RSI_EXIT_SHORT = 30.0
+# Уровни выхода по RSI14 (65 / 35)
+RSI_EXIT_LONG = 65.0
+RSI_EXIT_SHORT = 35.0
 
 # Глобальная переменная для ожидания ввода маржи по последнему сигналу
 LAST_SIGNAL = None
@@ -259,7 +260,7 @@ def webhook():
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-    # 1. Проверяем выход по RSI-14 (ужесточено до 70 / 30)
+    # 1. Проверяем выход по RSI-14 (65 / 35)
     current_rsi = calculate_rsi14(inst_id)
     if current_rsi is not None:
         if current_pos == "long" and current_rsi >= RSI_EXIT_LONG:
@@ -287,7 +288,7 @@ def webhook():
             send_telegram_msg(f"🛑 **СТОП-ЛОСС (Breakout UP) SHORT по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
         return "OK", 200
 
-    # 3. Входы по ретесту уровней (запрос маржи)
+    # 3. Входы по ретесту уровней (интерактивный запрос маржи в Telegram)
     if signal_type == "ENTRY_LONG":
         LAST_SIGNAL = {"symbol": symbol, "side": "LONG", "inst_id": inst_id, "current_pos": current_pos, "pnl_str": pnl_str}
         send_telegram_msg(f"🔔 **Поступил сигнал на LONG!**\n• Инструмент: `{inst_id}`\n\n💬 **Введите размер позиции в USDT** (отправьте число в чат):")
@@ -341,7 +342,7 @@ def telegram_callback():
                 pass
 
         if user_text.startswith("/status") or user_text.startswith("/settings"):
-            send_telegram_msg(f"⚙️ **Статус бота:**\n• Режим: **Интерактивный ввод маржи**\n• Выход по RSI-14: **70 (Long) / 30 (Short)**\n• Плечо: **Максимальное (авто)**")
+            send_telegram_msg(f"⚙️ **Статус бота:**\n• Режим: **Интерактивный ввод маржи**\n• Выход по RSI-14: **65 (Long) / 35 (Short)**\n• Плечо: **Максимальное (авто)**")
 
     return "OK", 200
 
