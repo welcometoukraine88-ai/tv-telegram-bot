@@ -260,6 +260,11 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         return False, f"Ошибка OKX: {msg}"
 
 def process_signal_execution(symbol, side_type):
+    global BOT_STATE
+    # Принудительно подтягиваем актуальное состояние с диска, 
+    # чтобы синхронизировать разные воркеры Gunicorn
+    BOT_STATE = load_state()
+
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
     rsi_history = calculate_rsi14_history(inst_id)
