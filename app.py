@@ -48,11 +48,10 @@ def get_current_margin():
         return 1.0
 
 def update_render_env_margin(new_margin):
-    """Обновляет переменную DEFAULT_MARGIN через API Render, чтобы настройка не стиралась"""
+    """Обновляет переменную DEFAULT_MARGIN через API Render с детальным логированием"""
     if not RENDER_API_KEY or not RENDER_SERVICE_ID:
-        # Если ключи не заданы, просто меняем в памяти текущего процесса
         os.environ["DEFAULT_MARGIN"] = str(new_margin)
-        return True
+        return True, "Ключи RENDER_API_KEY или SERVICE_ID не заданы в переменных окружения!"
 
     url = f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars"
     headers = {
@@ -61,26 +60,19 @@ def update_render_env_margin(new_margin):
         "Content-Type": "application/json"
     }
     
-    # Render требует передавать весь список или обновлять конкретную переменную
     payload = [
         {"key": "DEFAULT_MARGIN", "value": str(new_margin)}
     ]
     
     try:
-        # Используем метод PUT или PATCH в зависимости от API Render, обычно env-vars обновляются списком через PUT
         res = requests.put(url, json=payload, headers=headers, timeout=10)
         if res.status_code in [200, 201]:
             os.environ["DEFAULT_MARGIN"] = str(new_margin)
-            return True
+            return True, "Успешно обновлено в Render API"
         else:
-            print(f"Ошибка API Render: {res.text}")
-            # Запасной вариант: хотя бы в памяти обновим
-            os.environ["DEFAULT_MARGIN"] = str(new_margin)
-            return True
+            return False, f"Ошибка API Render (код {res.status_code}): {res.text}"
     except Exception as e:
-        print(f"Ошибка запроса к Render API: {e}")
-        os.environ["DEFAULT_MARGIN"] = str(new_margin)
-        return True
+        return False, f"Исключение запроса к Render API: {e}"
 
 def get_okx_signature(timestamp, method, request_path, body=""):
     message = timestamp + method + request_path + body
@@ -490,22 +482,24 @@ def telegram_callback():
 
     if "message" in data and "text" in data["message"]:
         user_text = data["message"]["text"].strip()
-
-        if user_text.startswith("/margin") or user_text.startswith("/setmargin"):
+if user_text.startswith("/margin") or user_text.startswith("/setmargin"):
             parts = user_text.split()
             if len(parts) > 1:
                 try:
                     new_margin = float(parts[1].replace(",", "."))
                     if new_margin > 0:
-                        update_render_env_margin(new_margin)
-                        send_telegram_msg(f"✅ Маржа на сделку успешно изменена на: **${new_margin} USDT** (сохранено на Render)")
+                        success, debug_msg = update_render_env_margin(new_margin)
+                        if success:
+                            send_telegram_msg(f"✅ Маржа изменена на: **${new_margin} USDT**\nℹ️ Статус: {debug_msg}")
+                        else:
+                            send_telegram_msg(f"❌ Не удалось сохранить на Render:\n`{debug_msg}`")
                     else:
                         send_telegram_msg("⚠️ Сумма должна быть больше нуля.")
                 except ValueError:
                     send_telegram_msg("⚠️ Неверный формат. Пример: `/margin 5`")
             else:
                 current_m = get_current_margin()
-                send_telegram_msg(f"ℹ️ Текущая маржа на сделку: **${current_m} USDT**\nДля изменения введите: `/margin <сумма>`")
+                send_telegram_msg(f"ℹ️ Текущая маржа: **${current_m} USDT**\n(ENV: {os.environ.get('DEFAULT_MARGIN', 'не задана')})")
         
         elif user_text.startswith("/settings") or user_text.startswith("/status"):
             current_m = get_current_margin()
