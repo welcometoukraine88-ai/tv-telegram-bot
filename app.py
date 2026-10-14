@@ -207,6 +207,7 @@ def parse_alert(text):
 
     text_str = text if isinstance(text, str) else json.dumps(text)
 
+    # 1. Пытаемся вытащить через JSON
     try:
         data = json.loads(text_str)
         if isinstance(data, dict):
@@ -216,16 +217,17 @@ def parse_alert(text):
     except Exception:
         pass
 
+    # 2. Усиленная регулярка: ищем любые тикеры (включая регистронезависимость)
     if symbol == "UNKNOWN":
-        match = re.search(r'([A-Z0-9]+(?:USDT|\.P))', text_str)
+        match = re.search(r'([A-Za-z0-9_]+(?:USDT|\.p|\.P))', text_str)
         if match:
-            symbol = match.group(1)
+            symbol = match.group(1).upper()
             if ":" in symbol:
                 symbol = symbol.split(":")[-1]
 
     text_lower = text_str.lower()
     
-    # Точный парсинг фраз из твоего индикатора Wyckoff Architecture
+    # 3. Распознавание триггеров
     if "buy level retest" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "BUY_RETEST"
