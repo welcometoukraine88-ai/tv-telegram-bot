@@ -247,15 +247,20 @@ def webhook():
     print(f"DEBUG TRADINGVIEW DATA: {raw_data}")
     print(f"DEBUG HEADERS: {dict(request.headers)}")
     
-    # 1. Сначала берем тикер из параметров URL (?ticker={{ticker}})
-    symbol = request.args.get('ticker', '').strip().upper()
+    # 1. Забираем тикер из параметров URL (?ticker={{ticker}})
+    url_ticker = request.args.get('ticker', '').strip()
+    if url_ticker and "{{" not in url_ticker:
+        symbol = url_ticker.upper()
+    else:
+        symbol = "UNKNOWN"
     
     # 2. Определяем тип сигнала из текста
     _, signal_type, pattern_name = parse_alert(raw_data)
 
     # Страховка: если в URL тикера не оказалось, пробуем вытащить старым методом
-    if not symbol or symbol == "UNKNOWN":
-        symbol, signal_type_parsed, pattern_name = parse_alert(raw_data)
+    if symbol == "UNKNOWN":
+        symbol_parsed, signal_type_parsed, pattern_name = parse_alert(raw_data)
+        symbol = symbol_parsed
         if signal_type == "UNKNOWN":
             signal_type = signal_type_parsed
 
