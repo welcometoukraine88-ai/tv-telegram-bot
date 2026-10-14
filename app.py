@@ -25,7 +25,7 @@ RSI_TIMEFRAME = "15m"
 RSI_EXIT_LONG = 65.0
 RSI_EXIT_SHORT = 35.0
 
-# Глобальный словарь для ожидания ввода маржи по конкретному сигналу
+# Словарь для ожидания ввода маржи: {chat_id: {"symbol": ..., "side": ..., "inst_id": ..., "message_id": ...}}
 PENDING_MARGIN_INPUT = {}
 
 def get_okx_signature(timestamp, method, request_path, body=""):
@@ -257,6 +257,109 @@ def parse_alert(text):
 
 @app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
+    global PENDING_MARGIN_INPUT
+    
+    data = request.get_json(silent=True)
+    
+    # 1. Если запрос пришел от Telegram (нажатие кнопки или текст)
+    if data and ("callback_query" in data or "message" in data):
+        # Обработка нажатий на инлайн-кнопки
+        if "callback_query" in data:
+            query = data["callback_query"]
+            query_id = query.get("id")
+            callback_data = query.get("data", "")
+            message = query.get("message", {})
+            chat_id = message.get("chat", {}).get("id")
+            message_id = message.get("message_id")
+            
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": query_id})
+            
+            if callback_data.startswith("skip_"):
+                if chat_id and message_id:
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", json={
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "text": message.get("text", "") + "\n\n_🚫 Сигнал пропущен_",
+                        "parse_mode": "Markdown"
+                    })
+                return "OK", 200
+                
+            if callback_data.startswith("enter_"):
+                parts = callback_data.split("_")
+                side = parts[1]
+                symbol = parts[2]
+                clean_symbol = symbol.replace(".P", "").replace("USDT", "")
+                inst_id = f"{clean_symbol}-USDT-SWAP"
+
+                PENDING_MARGIN_INPUT[chat_id] = {
+                    "symbol": symbol,
+                    "side": side,
+                    "inst_id": inst_id,
+                    "message_id": message_id
+                }
+
+                if chat_id and message_id:
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", json={
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "text": message.get("text", "") + f"\n\n💬 *Введите размер маржи (USDT) в чат для `{inst_id}`:*",
+                        "parse_mode": "Markdown"
+                    })
+                return "OK", 200
+
+        # Обработка текстового ввода суммы маржи
+        if "message" in data and "text" in data["message"]:
+            msg = data["message"]
+            chat_id = msg["chat"]["id"]
+            user_text = msg["text"].strip()
+
+            if chat_id in PENDING_MARGIN_INPUT:
+                try:
+                    margin_usdt = float(user_text.replace(",", "."))
+                    if margin_usdt > 0:
+                        sig = PENDING_MARGIN_INPUT.pop(chat_id)
+                        symbol = sig["symbol"]
+                        side = sig["side"]
+                        inst_id = sig["inst_id"]
+
+                        positions = get_okx_all_positions()
+                        pos_info = next((p for p in positions if p["instId"] == inst_id), None)
+                        current_pos = pos_info["posSide"] if pos_info else None
+                        upl = pos_info.get("upl", 0.0) if pos_info else 0.0
+                        upl_ratio = pos_info.get("uplRatio", 0.0) if pos_info else 0.0
+                        pnl_sign = "+" if upl >= 0 else ""
+                        pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+
+                        if side == "LONG" and current_pos == "short":
+                            close_res = close_okx_position(inst_id, "short")
+                            if close_res.get("code") == "0":
+                                send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт SHORT по `{inst_id}`\n• PnL: `{pnl_str}`")
+                        elif side == "SHORT" and current_pos == "long":
+                            close_res = close_okx_position(inst_id, "long")
+                            if close_res.get("code") == "0":
+                                send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт LONG по `{inst_id}`\n• PnL: `{pnl_str}`")
+
+                        success, err_msg = execute_okx_trade(symbol, side, margin_usdt)
+                        emoji = "🚀" if side == "LONG" else "🔻"
+                        
+                        if success:
+                            send_telegram_msg(
+                                f"{emoji} *ОРДЕР УСПЕШНО ОТКРЫТ*\n"
+                                f"━━━━━━━━━━━━━━━━━━━\n"
+                                f"• *Инструмент:* `{inst_id}`\n"
+                                f"• *Тип:* `{side}`\n"
+                                f"• *Маржа:* `${margin_usdt} USDT`\n"
+                                f"• *Плечо:* `Макс (авто)`"
+                            )
+                        else:
+                            send_telegram_msg(f"⚠️ *Ошибка открытия `{inst_id}`*\n• Причина: `{err_msg}`")
+                        return "OK", 200
+                except ValueError:
+                    send_telegram_msg("⚠️ Пожалуйста, введите корректное число для маржи (например: `10` или `25.5`)")
+        
+        return "OK", 200
+
+    # 2. Иначе обрабатываем как обычный алерт от TradingView
     raw_data = request.get_data(as_text=True)
     print(f"DEBUG TRADINGVIEW DATA: {raw_data}")
     
@@ -308,7 +411,7 @@ def webhook():
     if signal_type in ["BREAKOUT_DOWN", "BREAKOUT_UP"]:
         return "OK", 200
 
-    # Кнопки Вход / Пропустить
+    # Отправка сообщения с кнопками Вход / Пропустить
     if signal_type in ["ENTRY_LONG", "ENTRY_SHORT"]:
         is_long = signal_type == "ENTRY_LONG"
         circle_emoji = "🟢" if is_long else "🔴"
@@ -331,111 +434,6 @@ def webhook():
             ]
         }
         send_telegram_msg(msg_text, reply_markup=reply_markup)
-
-    return "OK", 200
-
-@app.route('/telegram-callback', methods=['POST'])
-def telegram_callback():
-    global PENDING_MARGIN_INPUT
-    data = request.get_json(silent=True)
-    if not data:
-        return "OK", 200
-
-    # 1. Нажатие на инлайн-кнопки
-    if "callback_query" in data:
-        query = data["callback_query"]
-        query_id = query.get("id")
-        callback_data = query.get("data", "")
-        message = query.get("message", {})
-        chat_id = message.get("chat", {}).get("id")
-        message_id = message.get("message_id")
-        
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": query_id})
-        
-        if callback_data.startswith("skip_"):
-            if chat_id and message_id:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", json={
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": message.get("text", "") + "\n\n_🚫 Сигнал пропущен_",
-                    "parse_mode": "Markdown"
-                })
-            return "OK", 200
-            
-        if callback_data.startswith("enter_"):
-            parts = callback_data.split("_")
-            side = parts[1]
-            symbol = parts[2]
-            clean_symbol = symbol.replace(".P", "").replace("USDT", "")
-            inst_id = f"{clean_symbol}-USDT-SWAP"
-
-            # Сохраняем состояние ожидания ввода маржи для этого чата
-            PENDING_MARGIN_INPUT[chat_id] = {
-                "symbol": symbol,
-                "side": side,
-                "inst_id": inst_id,
-                "message_id": message_id
-            }
-
-            if chat_id and message_id:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", json={
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "text": message.get("text", "") + f"\n\n💬 *Введите размер маржи (USDT) в чат для `{inst_id}`:*",
-                    "parse_mode": "Markdown"
-                })
-            return "OK", 200
-
-    # 2. Обычный текстовый ввод (сумма маржи)
-    if "message" in data and "text" in data["message"]:
-        msg = data["message"]
-        chat_id = msg["chat"]["id"]
-        user_text = msg["text"].strip()
-
-        if chat_id in PENDING_MARGIN_INPUT:
-            try:
-                margin_usdt = float(user_text.replace(",", "."))
-                if margin_usdt > 0:
-                    sig = PENDING_MARGIN_INPUT.pop(chat_id)
-                    symbol = sig["symbol"]
-                    side = sig["side"]
-                    inst_id = sig["inst_id"]
-                    msg_id = sig["message_id"]
-
-                    positions = get_okx_all_positions()
-                    pos_info = next((p for p in positions if p["instId"] == inst_id), None)
-                    current_pos = pos_info["posSide"] if pos_info else None
-                    upl = pos_info.get("upl", 0.0) if pos_info else 0.0
-                    upl_ratio = pos_info.get("uplRatio", 0.0) if pos_info else 0.0
-                    pnl_sign = "+" if upl >= 0 else ""
-                    pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
-
-                    if side == "LONG" and current_pos == "short":
-                        close_res = close_okx_position(inst_id, "short")
-                        if close_res.get("code") == "0":
-                            send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт SHORT по `{inst_id}`\n• PnL: `{pnl_str}`")
-                    elif side == "SHORT" and current_pos == "long":
-                        close_res = close_okx_position(inst_id, "long")
-                        if close_res.get("code") == "0":
-                            send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт LONG по `{inst_id}`\n• PnL: `{pnl_str}`")
-
-                    success, err_msg = execute_okx_trade(symbol, side, margin_usdt)
-                    emoji = "🚀" if side == "LONG" else "🔻"
-                    
-                    if success:
-                        send_telegram_msg(
-                            f"{emoji} *ОРДЕР УСПЕШНО ОТКРЫТ*\n"
-                            f"━━━━━━━━━━━━━━━━━━━\n"
-                            f"• *Инструмент:* `{inst_id}`\n"
-                            f"• *Тип:* `{side}`\n"
-                            f"• *Маржа:* `${margin_usdt} USDT`\n"
-                            f"• *Плечо:* `Макс (авто)`"
-                        )
-                    else:
-                        send_telegram_msg(f"⚠️ *Ошибка открытия `{inst_id}`*\n• Причина: `{err_msg}`")
-                    return "OK", 200
-            except ValueError:
-                send_telegram_msg("⚠️ Пожалуйста, введите корректное число для маржи (например: `10` или `25.5`)")
 
     return "OK", 200
 
