@@ -21,7 +21,6 @@ OKX_API_KEY = os.environ.get("OKX_API_KEY", "")
 OKX_SECRET_KEY = os.environ.get("OKX_SECRET_KEY", "")
 OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 
-# Данные для управления через API Render (чтобы настройки жили вечно)
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
@@ -33,7 +32,6 @@ RSI_TRAIL_SHORT = 35.0
 RSI_SL_LONG = 30.0
 RSI_SL_SHORT = 70.0
 
-# Статистика и отложенные сигналы хранятся в памяти, а маржа — надежно в переменной окружения Render
 BOT_STATE = {
     "pending_signals": [],
     "active_trades": {},
@@ -41,14 +39,12 @@ BOT_STATE = {
 }
 
 def get_current_margin():
-    # Читаем маржу напрямую из переменных окружения Render (по умолчанию 1.0)
     try:
         return float(os.environ.get("DEFAULT_MARGIN", "1.0"))
     except ValueError:
         return 1.0
 
 def update_render_env_margin(new_margin):
-    """Обновляет переменную DEFAULT_MARGIN через API Render с детальным логированием"""
     if not RENDER_API_KEY or not RENDER_SERVICE_ID:
         os.environ["DEFAULT_MARGIN"] = str(new_margin)
         return True, "Ключи RENDER_API_KEY или SERVICE_ID не заданы в переменных окружения!"
@@ -480,9 +476,10 @@ def webhook():
 def telegram_callback():
     data = request.get_json()
 
-    if "message" in data and "text" in data["message"]:
+    if data and "message" in data and "text" in data["message"]:
         user_text = data["message"]["text"].strip()
-if user_text.startswith("/margin") or user_text.startswith("/setmargin"):
+
+        if user_text.startswith("/margin") or user_text.startswith("/setmargin"):
             parts = user_text.split()
             if len(parts) > 1:
                 try:
