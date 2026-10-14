@@ -249,7 +249,7 @@ def webhook():
     raw_data = request.get_data(as_text=True)
     symbol, signal_type, pattern_name = parse_alert(raw_data)
 
-    # Если тикер или сигнал не распознаны (например, Spring, Liquidity Sweep и т.д.) — молча игнорируем без спама
+    # Если тикер не определен ИЛИ сигнал неизвестен — молча выходим, никакого спама!
     if symbol == "UNKNOWN" or signal_type == "UNKNOWN":
         return "OK", 200
 
@@ -264,23 +264,23 @@ def webhook():
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-    # 1. Проверяем выход по RSI-14 (65 / 35) — только если открыта позиция
+    # Фоновая проверка RSI для тейк-профита
     if current_pos:
         current_rsi = calculate_rsi14(inst_id)
         if current_rsi is not None:
             if current_pos == "long" and current_rsi >= RSI_EXIT_LONG:
                 close_res = close_okx_position(inst_id, "long")
                 if close_res.get("code") == "0":
-                    send_telegram_msg(f"🎯 **ТП / ТЕЙК (RSI {current_rsi} >= {RSI_EXIT_LONG}) LONG по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
+                    send_telegram_msg(f"🎯 **ТП (RSI {current_rsi}) LONG по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
                 return "OK", 200
 
             if current_pos == "short" and current_rsi <= RSI_EXIT_SHORT:
                 close_res = close_okx_position(inst_id, "short")
                 if close_res.get("code") == "0":
-                    send_telegram_msg(f"🎯 **ТП / ТЕЙК (RSI {current_rsi} <= {RSI_EXIT_SHORT}) SHORT по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
+                    send_telegram_msg(f"🎯 **ТП (RSI {current_rsi}) SHORT по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
                 return "OK", 200
 
-    # 2. Стоп-лосс по Range Breakout — закрываем позицию ТОЛЬКО ЕСЛИ она реально открыта по этому тикеру
+    # Стоп-лосс по Range Breakout (работает в фоне только если есть открытая позиция по этому инструменту)
     if signal_type == "BREAKOUT_DOWN" and current_pos == "long":
         close_res = close_okx_position(inst_id, "long")
         if close_res.get("code") == "0":
@@ -293,18 +293,18 @@ def webhook():
             send_telegram_msg(f"🛑 **СТОП-ЛОСС (Breakout UP) SHORT по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
         return "OK", 200
 
-    # Если пришел Breakout, но позиции нет — молчим
+    # Если это просто Breakout, но позиции нет — молчим
     if signal_type in ["BREAKOUT_DOWN", "BREAKOUT_UP"]:
         return "OK", 200
 
-    # 3. Входы по ретесту уровня (интерактивный запрос маржи в Telegram)
+    # Входы по ретесту уровней (запрос маржи)
     if signal_type == "ENTRY_LONG":
         LAST_SIGNAL = {"symbol": symbol, "side": "LONG", "inst_id": inst_id, "current_pos": current_pos, "pnl_str": pnl_str}
-        send_telegram_msg(f"🔔 **Поступил сигнал на LONG (`{inst_id}`)!**\n\n💬 **Введите размер позиции в USDT** (отправьте число в чат):")
+        send_telegram_msg(f"🔔 **Сигнал LONG (`{inst_id}`)!**\n\n💬 **Введите размер маржи в USDT:**")
 
     elif signal_type == "ENTRY_SHORT":
         LAST_SIGNAL = {"symbol": symbol, "side": "SHORT", "inst_id": inst_id, "current_pos": current_pos, "pnl_str": pnl_str}
-        send_telegram_msg(f"🔔 **Поступил сигнал на SHORT (`{inst_id}`)!**\n\n💬 **Введите размер позиции в USDT** (отправьте число в чат):")
+        send_telegram_msg(f"🔔 **Сигнал SHORT (`{inst_id}`)!**\n\n💬 **Введите размер маржи в USDT:**")
 
     return "OK", 200
 
