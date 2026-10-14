@@ -225,10 +225,11 @@ def parse_alert(text):
 
     text_lower = text_str.lower()
     
-    if "buy level retest triggered" in text_lower:
+    # Точный парсинг фраз из твоего индикатора Wyckoff Architecture
+    if "buy level retest" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "BUY_RETEST"
-    elif "sell level retest triggered" in text_lower:
+    elif "sell level retest" in text_lower:
         signal_type = "ENTRY_SHORT"
         pattern_name = "SELL_RETEST"
     elif "range breakout down" in text_lower:
@@ -288,14 +289,14 @@ def webhook():
             send_telegram_msg(f"🛑 **СТОП-ЛОСС (Breakout UP) SHORT по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
         return "OK", 200
 
-    # 3. Входы по ретесту уровней (интерактивный запрос маржи в Telegram)
+    # 3. Входы по ретесту уровня (интерактивный запрос маржи в Telegram)
     if signal_type == "ENTRY_LONG":
         LAST_SIGNAL = {"symbol": symbol, "side": "LONG", "inst_id": inst_id, "current_pos": current_pos, "pnl_str": pnl_str}
-        send_telegram_msg(f"🔔 **Поступил сигнал на LONG!**\n• Инструмент: `{inst_id}`\n\n💬 **Введите размер позиции в USDT** (отправьте число в чат):")
+        send_telegram_msg(f"🔔 **Поступил сигнал на LONG (`{inst_id}`)!**\n\n💬 **Введите размер позиции в USDT** (отправьте число в чат):")
 
     elif signal_type == "ENTRY_SHORT":
         LAST_SIGNAL = {"symbol": symbol, "side": "SHORT", "inst_id": inst_id, "current_pos": current_pos, "pnl_str": pnl_str}
-        send_telegram_msg(f"🔔 **Поступил сигнал на SHORT!**\n• Инструмент: `{inst_id}`\n\n💬 **Введите размер позиции в USDT** (отправьте число в чат):")
+        send_telegram_msg(f"🔔 **Поступил сигнал на SHORT (`{inst_id}`)!**\n\n💬 **Введите размер позиции в USDT** (отправьте число в чат):")
 
     return "OK", 200
 
