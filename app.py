@@ -6,7 +6,6 @@ import math
 import base64
 import hmac
 import hashlib
-from datetime import datetime
 from flask import Flask, request
 import requests
 
@@ -255,15 +254,15 @@ def parse_alert(text):
 
     return symbol, signal_type, pattern_name
 
-@app.route('/webhook', methods=['POST', 'GET'])
-def webhook():
+def process_incoming_request(req):
     global PENDING_MARGIN_INPUT
     
-    data = request.get_json(silent=True)
+    data = req.get_json(silent=True)
     
-    # 1. Если запрос пришел от Telegram (нажатие кнопки или текст)
-    if data and ("callback_query" in data or "message" in data):
-        # Обработка нажатий на инлайн-кнопки
+    # 1. Обработка Telegram (кнопки и текст)
+    if data:
+        print(f"📥 TELEGRAM JSON DATA: {json.dumps(data, ensure_ascii=False)}")
+        
         if "callback_query" in data:
             query = data["callback_query"]
             query_id = query.get("id")
@@ -307,7 +306,6 @@ def webhook():
                     })
                 return "OK", 200
 
-        # Обработка текстового ввода суммы маржи
         if "message" in data and "text" in data["message"]:
             msg = data["message"]
             chat_id = msg["chat"]["id"]
@@ -355,13 +353,13 @@ def webhook():
                             send_telegram_msg(f"⚠️ *Ошибка открытия `{inst_id}`*\n• Причина: `{err_msg}`")
                         return "OK", 200
                 except ValueError:
-                    send_telegram_msg("⚠️ Пожалуйста, введите корректное число для маржи (например: `10` или `25.5`)")
+                    send_telegram_msg("⚠️ Пожалуйста, введите число для маржи (например: `10`)")
         
         return "OK", 200
 
-    # 2. Иначе обрабатываем как обычный алерт от TradingView
-    raw_data = request.get_data(as_text=True)
-    print(f"DEBUG TRADINGVIEW DATA: {raw_data}")
+    # 2. Обработка алертов от TradingView
+    raw_data = req.get_data(as_text=True)
+    print(f"📈 TRADINGVIEW ALERT: {raw_data}")
     
     symbol, signal_type, pattern_name = parse_alert(raw_data)
 
@@ -379,20 +377,20 @@ def webhook():
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-    # Фоновая проверка RSI для тейк-профита
+    # Фиксированный выход по RSI (без трейлинга)
     if current_pos:
         current_rsi = calculate_rsi14(inst_id)
         if current_rsi is not None:
             if current_pos == "long" and current_rsi >= RSI_EXIT_LONG:
                 close_res = close_okx_position(inst_id, "long")
                 if close_res.get("code") == "0":
-                    send_telegram_msg(f"🎯 *ТЕЙК-ПРОФИТ (RSI {current_rsi})*\n• Инструмент: `{inst_id}`\n• Направление: `LONG`\n• PnL: `{pnl_str}`")
+                    send_telegram_msg(f"🎯 *ВЫХОД ПО RSI ({current_rsi})*\n• Инструмент: `{inst_id}`\n• Направление: `LONG`\n• PnL: `{pnl_str}`")
                 return "OK", 200
 
             if current_pos == "short" and current_rsi <= RSI_EXIT_SHORT:
                 close_res = close_okx_position(inst_id, "short")
                 if close_res.get("code") == "0":
-                    send_telegram_msg(f"🎯 *ТЕЙК-ПРОФИТ (RSI {current_rsi})*\n• Инструмент: `{inst_id}`\n• Направление: `SHORT`\n• PnL: `{pnl_str}`")
+                    send_telegram_msg(f"🎯 *ВЫХОД ПО RSI ({current_rsi})*\n• Инструмент: `{inst_id}`\n• Направление: `SHORT`\n• PnL: `{pnl_str}`")
                 return "OK", 200
 
     # Стоп-лосс по Range Breakout
@@ -411,7 +409,7 @@ def webhook():
     if signal_type in ["BREAKOUT_DOWN", "BREAKOUT_UP"]:
         return "OK", 200
 
-    # Отправка сообщения с кнопками Вход / Пропустить
+    # Отправка кнопок Вход / Пропустить
     if signal_type in ["ENTRY_LONG", "ENTRY_SHORT"]:
         is_long = signal_type == "ENTRY_LONG"
         circle_emoji = "🟢" if is_long else "🔴"
@@ -437,9 +435,19 @@ def webhook():
 
     return "OK", 200
 
-@app.route('/', methods=['GET'])
-def index():
-    return "OKX Smart Bot is Running!", 200
+@app.route('/', methods=['POST', 'GET'])
+def index_root():
+    if request.method == 'GET':
+        return "OKX Smart Bot is Running!", 200
+    return process_incoming_request(request)
+
+@app.route('/webhook', methods=['POST', 'GET'])
+def webhook_path():
+    return process_incoming_request(request)
+
+@app.route('/telegram-callback', methods=['POST', 'GET'])
+def telegram_callback_path():
+    return process_incoming_request(request)
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
