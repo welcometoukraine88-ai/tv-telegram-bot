@@ -29,18 +29,22 @@ RSI_TRAIL_SHORT = 35.0
 RSI_SL_LONG = 30.0
 RSI_SL_SHORT = 70.0
 
-# Память для состояния бота и очереди сигналов
-BOT_STATE = {
-    "pending_signals": [],
-    "active_trades": {},
-    "stats": {"tp_closed": 0, "sl_closed": 0, "total_pnl": 0.0}
+# Сумма маржи по умолчанию (1 USDT)
+BOT_SETTINGS = {
+    "default_margin": 1.0
 }
 
-def get_current_margin():
-    try:
-        return float(os.environ.get("DEFAULT_MARGIN", "1.0"))
-    except ValueError:
-        return 1.0
+STATS_DATA = {
+    "tp_closed": 0,
+    "sl_closed": 0,
+    "total_pnl": 0.0
+}
+
+# Очередь отложенных входов (ждем нужного RSI)
+PENDING_ENTRY_SIGNALS = []
+
+# Метаданные сделок для защиты СЛ на первые 4 бара (1 час)
+ACTIVE_TRADES_META = {}
 
 def get_okx_signature(timestamp, method, request_path, body=""):
     message = timestamp + method + request_path + body
@@ -226,7 +230,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     res = okx_request("POST", "/api/v5/trade/order", order_body)
 
     if res.get("code") == "0":
-        BOT_STATE["active_trades"][inst_id] = {
+        ACTIVE_TRADES_META[inst_id] = {
             "entry_time": time.time(),
             "bars_passed": 0
         }
@@ -244,7 +248,7 @@ def process_signal_execution(symbol, side_type):
         return False, "Нет данных RSI"
 
     curr_rsi = rsi_history[-1]
-    current_margin = get_current_margin()
+    current_margin = float(BOT_SETTINGS["default_margin"])
 
     positions = get_okx_all_positions()
     pos_info = next((p for p in positions if p["instId"] == inst_id), None)
@@ -259,7 +263,7 @@ def process_signal_execution(symbol, side_type):
             upl_ratio = pos_info.get("uplRatio", 0.0)
             close_res = close_okx_position(inst_id, "short")
             if close_res.get("code") == "0":
-                BOT_STATE["stats"]["total_pnl"] += upl
+                STATS_DATA["total_pnl"] += upl
                 pnl_sign = "+" if upl >= 0 else ""
                 send_telegram_msg(f"🔄 **Закрыт SHORT по `{inst_id}`** (разворот Spring).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
 
@@ -275,7 +279,7 @@ def process_signal_execution(symbol, side_type):
             upl_ratio = pos_info.get("uplRatio", 0.0)
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
-                BOT_STATE["stats"]["total_pnl"] += upl
+                STATS_DATA["total_pnl"] += upl
                 pnl_sign = "+" if upl >= 0 else ""
                 send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}`** (разворот Upthrust).\n💰 **PnL:** `{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)`")
 
@@ -286,29 +290,29 @@ def process_signal_execution(symbol, side_type):
 
 def check_and_close_positions_by_rsi():
     try:
+        global PENDING_ENTRY_SIGNALS
         still_pending = []
-        for sig in BOT_STATE["pending_signals"]:
+        for sig in PENDING_ENTRY_SIGNALS:
             success, _ = process_signal_execution(sig["symbol"], sig["side_type"])
             if not success:
                 still_pending.append(sig)
-        BOT_STATE["pending_signals"] = still_pending
+        PENDING_ENTRY_SIGNALS = still_pending
 
         positions = get_okx_all_positions()
         if not positions:
-            if BOT_STATE["active_trades"]:
-                BOT_STATE["active_trades"].clear()
+            ACTIVE_TRADES_META.clear()
             return
 
         for pos in positions:
             inst_id = pos["instId"]
             pos_side = pos["posSide"]
             
-            if inst_id in BOT_STATE["active_trades"]:
-                BOT_STATE["active_trades"][inst_id]["bars_passed"] += 1
+            if inst_id in ACTIVE_TRADES_META:
+                ACTIVE_TRADES_META[inst_id]["bars_passed"] += 1
             else:
-                BOT_STATE["active_trades"][inst_id] = {"bars_passed": 4}
+                ACTIVE_TRADES_META[inst_id] = {"bars_passed": 4}
 
-            bars_passed = BOT_STATE["active_trades"][inst_id]["bars_passed"]
+            bars_passed = ACTIVE_TRADES_META[inst_id]["bars_passed"]
             is_sl_protected = (bars_passed <= 4)
 
             rsi_history = calculate_rsi14_history(inst_id)
@@ -328,36 +332,36 @@ def check_and_close_positions_by_rsi():
                     if not is_sl_protected:
                         close_res = close_okx_position(inst_id, "long")
                         if close_res.get("code") == "0":
-                            BOT_STATE["stats"]["sl_closed"] += 1
-                            BOT_STATE["stats"]["total_pnl"] += upl
-                            BOT_STATE["active_trades"].pop(inst_id, None)
+                            STATS_DATA["sl_closed"] += 1
+                            STATS_DATA["total_pnl"] += upl
                             send_telegram_msg(f"🛑 **СТОП-ЛОСС LONG по `{inst_id}`**\n• RSI < 30: **{curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
+                            ACTIVE_TRADES_META.pop(inst_id, None)
                 
                 elif curr_rsi >= RSI_TRAIL_LONG and prev_rsi > curr_rsi:
                     close_res = close_okx_position(inst_id, "long")
                     if close_res.get("code") == "0":
-                        BOT_STATE["stats"]["tp_closed"] += 1
-                        BOT_STATE["stats"]["total_pnl"] += upl
-                        BOT_STATE["active_trades"].pop(inst_id, None)
+                        STATS_DATA["tp_closed"] += 1
+                        STATS_DATA["total_pnl"] += upl
                         send_telegram_msg(f"🎯 **Трейлинг-стоп LONG по `{inst_id}`**\n• RSI разворот вниз: **{prev_rsi} ➔ {curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
+                        ACTIVE_TRADES_META.pop(inst_id, None)
 
             elif pos_side == "short":
                 if curr_rsi > RSI_SL_SHORT:
                     if not is_sl_protected:
                         close_res = close_okx_position(inst_id, "short")
                         if close_res.get("code") == "0":
-                            BOT_STATE["stats"]["sl_closed"] += 1
-                            BOT_STATE["stats"]["total_pnl"] += upl
-                            BOT_STATE["active_trades"].pop(inst_id, None)
+                            STATS_DATA["sl_closed"] += 1
+                            STATS_DATA["total_pnl"] += upl
                             send_telegram_msg(f"🛑 **СТОП-ЛОСС SHORT по `{inst_id}`**\n• RSI > 70: **{curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
+                            ACTIVE_TRADES_META.pop(inst_id, None)
 
                 elif curr_rsi <= RSI_TRAIL_SHORT and prev_rsi < curr_rsi:
                     close_res = close_okx_position(inst_id, "short")
                     if close_res.get("code") == "0":
-                        BOT_STATE["stats"]["tp_closed"] += 1
-                        BOT_STATE["stats"]["total_pnl"] += upl
-                        BOT_STATE["active_trades"].pop(inst_id, None)
+                        STATS_DATA["tp_closed"] += 1
+                        STATS_DATA["total_pnl"] += upl
                         send_telegram_msg(f"🎯 **Трейлинг-стоп SHORT по `{inst_id}`**\n• RSI разворот вверх: **{prev_rsi} ➔ {curr_rsi}**\n💰 **PnL:** `{pnl_str}`")
+                        ACTIVE_TRADES_META.pop(inst_id, None)
 
     except Exception as e:
         print(f"Ошибка проверки RSI: {e}")
@@ -367,9 +371,9 @@ def send_periodical_report():
         positions = get_okx_all_positions()
         open_count = len(positions)
 
-        tp_count = BOT_STATE["stats"]["tp_closed"]
-        sl_count = BOT_STATE["stats"]["sl_closed"]
-        period_pnl = BOT_STATE["stats"]["total_pnl"]
+        tp_count = STATS_DATA["tp_closed"]
+        sl_count = STATS_DATA["sl_closed"]
+        period_pnl = STATS_DATA["total_pnl"]
 
         pnl_sign = "+" if period_pnl >= 0 else ""
         pnl_str = f"{pnl_sign}${period_pnl:,.2f}"
@@ -384,9 +388,9 @@ def send_periodical_report():
 
         send_telegram_msg(report_msg)
 
-        BOT_STATE["stats"]["tp_closed"] = 0
-        BOT_STATE["stats"]["sl_closed"] = 0
-        BOT_STATE["stats"]["total_pnl"] = 0.0
+        STATS_DATA["tp_closed"] = 0
+        STATS_DATA["sl_closed"] = 0
+        STATS_DATA["total_pnl"] = 0.0
 
     except Exception as e:
         print(f"Ошибка отчета: {e}")
@@ -438,15 +442,43 @@ def webhook():
     
     if not success:
         signal_entry = {"symbol": symbol, "side_type": side_type, "pattern": pattern_name}
-        if signal_entry not in BOT_STATE["pending_signals"]:
-            BOT_STATE["pending_signals"].append(signal_entry)
-            send_telegram_msg(f"⏳ **Сигнал {pattern_name} ({symbol}) получен**. {msg} Заявка поставлена в очередь.")
+        if signal_entry not in PENDING_ENTRY_SIGNALS:
+            PENDING_ENTRY_SIGNALS.append(signal_entry)
+
+    return "OK", 200
+
+@app.route('/telegram-callback', methods=['POST'])
+def telegram_callback():
+    data = request.get_json(silent=True)
+    if not data:
+        return "OK", 200
+
+    if "message" in data and "text" in data["message"]:
+        user_text = data["message"]["text"].strip()
+
+        if user_text.startswith("/margin") or user_text.startswith("/setmargin"):
+            parts = user_text.split()
+            if len(parts) > 1:
+                try:
+                    new_margin = float(parts[1].replace(",", "."))
+                    if new_margin > 0:
+                        BOT_SETTINGS["default_margin"] = new_margin
+                        send_telegram_msg(f"✅ Маржа на сделку успешно изменена на: **${new_margin} USDT**")
+                    else:
+                        send_telegram_msg("⚠️ Сумма должна быть больше нуля.")
+                except ValueError:
+                    send_telegram_msg("⚠️ Неверный формат. Пример: `/margin 1`")
+            else:
+                send_telegram_msg(f"ℹ️ Текущая маржа на сделку: **${BOT_SETTINGS['default_margin']} USDT**\nДля изменения введите: `/margin <сумма>`")
+        
+        elif user_text.startswith("/settings") or user_text.startswith("/status"):
+            send_telegram_msg(f"⚙️ **Текущие настройки бота:**\n• Маржа на сделку: **${BOT_SETTINGS['default_margin']} USDT**\n• Плечо: **Максимальное (авто)**")
 
     return "OK", 200
 
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Trading Bot is Running!", 200
+    return "OKX Smart Bot is Running Silently!", 200
 
 scheduler = BackgroundScheduler(daemon=True)
 
