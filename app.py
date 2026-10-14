@@ -206,7 +206,6 @@ def parse_alert(text):
 
     text_str = text if isinstance(text, str) else json.dumps(text)
 
-    # 1. Пытаемся найти тикер в JSON
     try:
         data = json.loads(text_str)
         if isinstance(data, dict):
@@ -216,7 +215,6 @@ def parse_alert(text):
     except Exception:
         pass
 
-    # 2. Ищем тикер через регулярку в тексте
     if symbol == "UNKNOWN":
         match = re.search(r'([A-Za-z0-9_]+(?:USDT|\.p|\.P))', text_str)
         if match:
@@ -226,7 +224,6 @@ def parse_alert(text):
 
     text_lower = text_str.lower()
     
-    # 3. Распознавание триггеров
     if "buy level retest" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "BUY_RETEST"
@@ -249,7 +246,13 @@ def webhook():
     raw_data = request.get_data(as_text=True)
     symbol, signal_type, pattern_name = parse_alert(raw_data)
 
-    # Если тикер не определен ИЛИ сигнал неизвестен — молча выходим, никакого спама!
+    # Если тикер не найден в тексте, попробуем поискать его в параметрах URL или заголовках на всякий случай
+    if symbol == "UNKNOWN":
+        url_ticker = request.args.get('ticker', '').strip()
+        if url_ticker:
+            symbol = url_ticker.upper()
+
+    # Если тикер или сигнал не распознаны — молча выходим
     if symbol == "UNKNOWN" or signal_type == "UNKNOWN":
         return "OK", 200
 
