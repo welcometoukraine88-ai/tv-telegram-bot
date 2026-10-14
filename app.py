@@ -29,8 +29,8 @@ RSI_TRAIL_SHORT = 35.0
 RSI_SL_LONG = 30.0
 RSI_SL_SHORT = 70.0
 
+# Память для состояния бота и очереди сигналов
 BOT_STATE = {
-    "default_margin": 1.0,
     "pending_signals": [],
     "active_trades": {},
     "stats": {"tp_closed": 0, "sl_closed": 0, "total_pnl": 0.0}
@@ -38,7 +38,7 @@ BOT_STATE = {
 
 def get_current_margin():
     try:
-        return float(BOT_STATE.get("default_margin", 1.0))
+        return float(os.environ.get("DEFAULT_MARGIN", "1.0"))
     except ValueError:
         return 1.0
 
@@ -444,39 +444,9 @@ def webhook():
 
     return "OK", 200
 
-@app.route('/telegram-callback', methods=['POST'])
-def telegram_callback():
-    data = request.get_json()
-    print(f"DEBUG TELEGRAM DATA: {data}") # Печатаем пришедший JSON в логи Render
-
-    if data and "message" in data and "text" in data["message"]:
-        user_text = data["message"]["text"].strip()
-
-        if user_text.startswith("/margin") or user_text.startswith("/setmargin"):
-            parts = user_text.split()
-            if len(parts) > 1:
-                try:
-                    new_margin = float(parts[1].replace(",", "."))
-                    if new_margin > 0:
-                        BOT_STATE["default_margin"] = new_margin
-                        send_telegram_msg(f"✅ Маржа успешно изменена на: **${new_margin} USDT**")
-                    else:
-                        send_telegram_msg("⚠️ Сумма должна быть больше нуля.")
-                except ValueError:
-                    send_telegram_msg("⚠️ Неверный формат. Пример: `/margin 5`")
-            else:
-                current_m = get_current_margin()
-                send_telegram_msg(f"ℹ️ Текущая маржа: **${current_m} USDT**\nДля изменения отправь: `/margin <сумма>`")
-        
-        elif user_text.startswith("/settings") or user_text.startswith("/status"):
-            current_m = get_current_margin()
-            send_telegram_msg(f"⚙️ **Текущие настройки бота:**\n• Маржа на сделку: **${current_m} USDT**\n• Плечо: **Максимальное (авто)**")
-
-    return "OK", 200
-
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Smart Bot is Running!", 200
+    return "OKX Trading Bot is Running!", 200
 
 scheduler = BackgroundScheduler(daemon=True)
 
