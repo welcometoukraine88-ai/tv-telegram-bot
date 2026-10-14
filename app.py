@@ -223,7 +223,6 @@ def webhook():
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-    # Стоп-лосс по Range Breakout срабатывает автоматически
     if signal_type == "BREAKOUT_DOWN" and current_pos == "long":
         close_res = close_okx_position(inst_id, "long")
         if close_res.get("code") == "0":
@@ -236,7 +235,6 @@ def webhook():
             send_telegram_msg(f"🛑 **СТОП-ЛОСС (Breakout UP) SHORT по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
         return "OK", 200
 
-    # Обработка входов: запоминаем сигнал и запрашиваем размер маржи у пользователя
     if signal_type == "ENTRY_LONG":
         LAST_SIGNAL = {"symbol": symbol, "side": "LONG", "inst_id": inst_id, "current_pos": current_pos, "pnl_str": pnl_str}
         send_telegram_msg(f"🔔 **Поступил сигнал на LONG!**\n• Инструмент: `{inst_id}`\n\n💬 **Введите размер позиции в USDT** (отправьте число в чат):")
@@ -257,13 +255,12 @@ def telegram_callback():
     if "message" in data and "text" in data["message"]:
         user_text = data["message"]["text"].strip()
 
-        # Проверяем, не вводит ли пользователь сумму для ожидающего сигнала
         if LAST_SIGNAL is not None:
             try:
                 margin_usdt = float(user_text.replace(",", "."))
                 if margin_usdt > 0:
                     sig = LAST_SIGNAL
-                    LAST_SIGNAL = None  брос ожидания
+                    LAST_SIGNAL = None
 
                     symbol = sig["symbol"]
                     side = sig["side"]
@@ -271,7 +268,6 @@ def telegram_callback():
                     current_pos = sig["current_pos"]
                     pnl_str = sig["pnl_str"]
 
-                    # Закрываем противоположную позицию при развороте
                     if side == "LONG" and current_pos == "short":
                         close_res = close_okx_position(inst_id, "short")
                         if close_res.get("code") == "0":
@@ -281,7 +277,6 @@ def telegram_callback():
                         if close_res.get("code") == "0":
                             send_telegram_msg(f"🔄 **Закрыт LONG по `{inst_id}` (Разворот в Шорт)**\n💰 **PnL:** `{pnl_str}`")
 
-                    # Открываем сделку на введенную сумму
                     success, err_msg = execute_okx_trade(symbol, side, margin_usdt)
                     if success:
                         emoji = "🚀" if side == "LONG" else "🔻"
@@ -290,9 +285,8 @@ def telegram_callback():
                         send_telegram_msg(f"⚠️ **Ошибка открытия `{inst_id}`**: {err_msg}")
                     return "OK", 200
             except ValueError:
-                pass  # Если введено не число, идем дальше к обычным командам
+                pass
 
-        # Обычные команды
         if user_text.startswith("/status") or user_text.startswith("/settings"):
             send_telegram_msg(f"⚙️ **Статус бота:**\n• Режим: **Интерактивный ввод маржи**\n• Плечо: **Максимальное (авто)**")
 
