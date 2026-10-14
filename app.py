@@ -1,4 +1,4 @@
-import os
+iimport os
 import re
 import json
 import time
@@ -21,9 +21,6 @@ OKX_API_KEY = os.environ.get("OKX_API_KEY", "")
 OKX_SECRET_KEY = os.environ.get("OKX_SECRET_KEY", "")
 OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 
-RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
-RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
-
 OKX_BASE_URL = "https://www.okx.com"
 
 RSI_TIMEFRAME = "15m"
@@ -32,7 +29,9 @@ RSI_TRAIL_SHORT = 35.0
 RSI_SL_LONG = 30.0
 RSI_SL_SHORT = 70.0
 
+# Глобальное хранилище состояния прямо в памяти процесса
 BOT_STATE = {
+    "default_margin": 1.0,
     "pending_signals": [],
     "active_trades": {},
     "stats": {"tp_closed": 0, "sl_closed": 0, "total_pnl": 0.0}
@@ -40,35 +39,9 @@ BOT_STATE = {
 
 def get_current_margin():
     try:
-        return float(os.environ.get("DEFAULT_MARGIN", "1.0"))
+        return float(BOT_STATE.get("default_margin", 1.0))
     except ValueError:
         return 1.0
-
-def update_render_env_margin(new_margin):
-    if not RENDER_API_KEY or not RENDER_SERVICE_ID:
-        os.environ["DEFAULT_MARGIN"] = str(new_margin)
-        return True, "Ключи RENDER_API_KEY или SERVICE_ID не заданы в переменных окружения!"
-
-    url = f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars"
-    headers = {
-        "Authorization": f"Bearer {RENDER_API_KEY}",
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
-    
-    payload = [
-        {"key": "DEFAULT_MARGIN", "value": str(new_margin)}
-    ]
-    
-    try:
-        res = requests.put(url, json=payload, headers=headers, timeout=10)
-        if res.status_code in [200, 201]:
-            os.environ["DEFAULT_MARGIN"] = str(new_margin)
-            return True, "Успешно обновлено в Render API"
-        else:
-            return False, f"Ошибка API Render (код {res.status_code}): {res.text}"
-    except Exception as e:
-        return False, f"Исключение запроса к Render API: {e}"
 
 def get_okx_signature(timestamp, method, request_path, body=""):
     message = timestamp + method + request_path + body
@@ -485,18 +458,15 @@ def telegram_callback():
                 try:
                     new_margin = float(parts[1].replace(",", "."))
                     if new_margin > 0:
-                        success, debug_msg = update_render_env_margin(new_margin)
-                        if success:
-                            send_telegram_msg(f"✅ Маржа изменена на: **${new_margin} USDT**\nℹ️ Статус: {debug_msg}")
-                        else:
-                            send_telegram_msg(f"❌ Не удалось сохранить на Render:\n`{debug_msg}`")
+                        BOT_STATE["default_margin"] = new_margin
+                        send_telegram_msg(f"✅ Маржа успешно изменена на: **${new_margin} USDT**")
                     else:
                         send_telegram_msg("⚠️ Сумма должна быть больше нуля.")
                 except ValueError:
                     send_telegram_msg("⚠️ Неверный формат. Пример: `/margin 5`")
             else:
                 current_m = get_current_margin()
-                send_telegram_msg(f"ℹ️ Текущая маржа: **${current_m} USDT**\n(ENV: {os.environ.get('DEFAULT_MARGIN', 'не задана')})")
+                send_telegram_msg(f"ℹ️ Текущая маржа: **${current_m} USDT**\nДля изменения отправь: `/margin <сумма>`")
         
         elif user_text.startswith("/settings") or user_text.startswith("/status"):
             current_m = get_current_margin()
@@ -506,7 +476,7 @@ def telegram_callback():
 
 @app.route('/', methods=['GET'])
 def index():
-    return "OKX Smart Bot with Render API State is Running!", 200
+    return "OKX Smart Bot is Running!", 200
 
 scheduler = BackgroundScheduler(daemon=True)
 
