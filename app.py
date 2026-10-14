@@ -244,19 +244,23 @@ def webhook():
     global LAST_SIGNAL
     
     raw_data = request.get_data(as_text=True)
-    print(f"DEBUG TRADINGVIEW DATA: {raw_data}") # <--- Добавь эту строчку
-    print(f"DEBUG HEADERS: {dict(request.headers)}") # <--- И эту тоже
+    print(f"DEBUG TRADINGVIEW DATA: {raw_data}")
+    print(f"DEBUG HEADERS: {dict(request.headers)}")
     
-    symbol, signal_type, pattern_name = parse_alert(raw_data)
+    # 1. Сначала берем тикер из параметров URL (?ticker={{ticker}})
+    symbol = request.args.get('ticker', '').strip().upper()
+    
+    # 2. Определяем тип сигнала из текста
+    _, signal_type, pattern_name = parse_alert(raw_data)
 
-    # Если тикер не найден в тексте, попробуем поискать его в параметрах URL или заголовках на всякий случай
-    if symbol == "UNKNOWN":
-        url_ticker = request.args.get('ticker', '').strip()
-        if url_ticker:
-            symbol = url_ticker.upper()
+    # Страховка: если в URL тикера не оказалось, пробуем вытащить старым методом
+    if not symbol or symbol == "UNKNOWN":
+        symbol, signal_type_parsed, pattern_name = parse_alert(raw_data)
+        if signal_type == "UNKNOWN":
+            signal_type = signal_type_parsed
 
-    # Если тикер или сигнал не распознаны — молча выходим
-    if symbol == "UNKNOWN" or signal_type == "UNKNOWN":
+    # Если тикер или сигнал все еще не распознаны — выходим
+    if not symbol or symbol == "UNKNOWN" or signal_type == "UNKNOWN":
         return "OK", 200
 
     clean_symbol = symbol.replace(".P", "").replace("USDT", "")
@@ -286,7 +290,7 @@ def webhook():
                     send_telegram_msg(f"🎯 **ТП (RSI {current_rsi}) SHORT по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
                 return "OK", 200
 
-    # Стоп-лосс по Range Breakout (работает в фоне только если есть открытая позиция по этому инструменту)
+    # Стоп-лосс по Range Breakout
     if signal_type == "BREAKOUT_DOWN" and current_pos == "long":
         close_res = close_okx_position(inst_id, "long")
         if close_res.get("code") == "0":
@@ -299,7 +303,6 @@ def webhook():
             send_telegram_msg(f"🛑 **СТОП-ЛОСС (Breakout UP) SHORT по `{inst_id}`**\n💰 **PnL:** `{pnl_str}`")
         return "OK", 200
 
-    # Если это просто Breakout, но позиции нет — молчим
     if signal_type in ["BREAKOUT_DOWN", "BREAKOUT_UP"]:
         return "OK", 200
 
