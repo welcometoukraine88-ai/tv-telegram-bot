@@ -8,6 +8,7 @@ import hmac
 import hashlib
 from flask import Flask, request
 import requests
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
@@ -257,6 +258,42 @@ def parse_alert(text):
 
     return symbol, signal_type, pattern_name
 
+# --- ФОНОВАЯ ПРОВЕРКА RSI КАЖДЫЕ 15 МИНУТ ---
+def scheduled_rsi_check():
+    print("⏰ Запуск плановой проверки RSI для открытых позиций...")
+    positions = get_okx_all_positions()
+    if not positions:
+        return
+
+    for pos in positions:
+        inst_id = pos["instId"]
+        current_pos = pos["posSide"]
+        upl = pos.get("upl", 0.0)
+        upl_ratio = pos.get("uplRatio", 0.0)
+        pnl_sign = "+" if upl >= 0 else ""
+        pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+
+        current_rsi = calculate_rsi14(inst_id)
+        if current_rsi is None:
+            continue
+
+        print(f"📊 {inst_id} ({current_pos.upper()}): текущий RSI = {current_rsi}")
+
+        if current_pos == "long" and current_rsi >= RSI_EXIT_LONG:
+            close_res = close_okx_position(inst_id, "long")
+            if close_res.get("code") == "0":
+                send_telegram_msg(f"🎯 *ПЛАНОВЫЙ ТЕЙК-ПРОФИТ (RSI: {current_rsi})*\n• Инструмент: `{inst_id}`\n• Направление: `LONG`\n• PnL: `{pnl_str}`")
+
+        elif current_pos == "short" and current_rsi <= RSI_EXIT_SHORT:
+            close_res = close_okx_position(inst_id, "short")
+            if close_res.get("code") == "0":
+                send_telegram_msg(f"🎯 *ПЛАНОВЫЙ ТЕЙК-ПРОФИТ (RSI: {current_rsi})*\n• Инструмент: `{inst_id}`\n• Направление: `SHORT`\n• PnL: `{pnl_str}`")
+
+# Запуск фонового шедулера (проверка каждые 15 минут)
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=scheduled_rsi_check, trigger="interval", minutes=15)
+scheduler.start()
+
 @app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
     global PENDING_MARGIN_INPUT
@@ -380,22 +417,6 @@ def webhook():
     upl_ratio = pos_info.get("uplRatio", 0.0) if pos_info else 0.0
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
-
-    # Фиксированный выход по RSI (70 для лонга, 30 для шорта)
-    if current_pos:
-        current_rsi = calculate_rsi14(inst_id)
-        if current_rsi is not None:
-            if current_pos == "long" and current_rsi >= RSI_EXIT_LONG:
-                close_res = close_okx_position(inst_id, "long")
-                if close_res.get("code") == "0":
-                    send_telegram_msg(f"🎯 *ВЫХОД ПО RSI ({current_rsi})*\n• Инструмент: `{inst_id}`\n• Направление: `LONG`\n• PnL: `{pnl_str}`")
-                return "OK", 200
-
-            if current_pos == "short" and current_rsi <= RSI_EXIT_SHORT:
-                close_res = close_okx_position(inst_id, "short")
-                if close_res.get("code") == "0":
-                    send_telegram_msg(f"🎯 *ВЫХОД ПО RSI ({current_rsi})*\n• Инструмент: `{inst_id}`\n• Направление: `SHORT`\n• PnL: `{pnl_str}`")
-                return "OK", 200
 
     # Стоп-лосс по Range Breakout
     if signal_type == "BREAKOUT_DOWN" and current_pos == "long":
