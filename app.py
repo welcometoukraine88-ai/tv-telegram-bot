@@ -24,6 +24,9 @@ RSI_TIMEFRAME = "15m"
 RSI_EXIT_LONG = 65.0
 RSI_EXIT_SHORT = 35.0
 
+# Автоматическая маржа по умолчанию 1.0 USDT (можно переопределить через env DEFAULT_MARGIN)
+DEFAULT_MARGIN = float(os.environ.get("DEFAULT_MARGIN", "1.0"))
+
 # Словарь для ожидания ввода маржи: {chat_id: {"symbol": ..., "side": ..., "inst_id": ..., "message_id": ...}}
 PENDING_MARGIN_INPUT = {}
 
@@ -254,12 +257,13 @@ def parse_alert(text):
 
     return symbol, signal_type, pattern_name
 
-def process_incoming_request(req):
+@app.route('/webhook', methods=['POST', 'GET'])
+def webhook():
     global PENDING_MARGIN_INPUT
     
-    data = req.get_json(silent=True)
+    data = request.get_json(silent=True)
     
-    # 1. Обработка Telegram (кнопки и текст)
+    # 1. Обработка Telegram (оставляем совместимость, если прилетит что-то из телеги)
     if data:
         print(f"📥 TELEGRAM JSON DATA: {json.dumps(data, ensure_ascii=False)}")
         
@@ -358,7 +362,7 @@ def process_incoming_request(req):
         return "OK", 200
 
     # 2. Обработка алертов от TradingView
-    raw_data = req.get_data(as_text=True)
+    raw_data = request.get_data(as_text=True)
     print(f"📈 TRADINGVIEW ALERT: {raw_data}")
     
     symbol, signal_type, pattern_name = parse_alert(raw_data)
@@ -409,45 +413,40 @@ def process_incoming_request(req):
     if signal_type in ["BREAKOUT_DOWN", "BREAKOUT_UP"]:
         return "OK", 200
 
-    # Отправка кнопок Вход / Пропустить
+    # Автоматический вход по сигналу на DEFAULT_MARGIN (1 USDT) с разворотом
     if signal_type in ["ENTRY_LONG", "ENTRY_SHORT"]:
-        is_long = signal_type == "ENTRY_LONG"
-        circle_emoji = "🟢" if is_long else "🔴"
-        side_code = "LONG" if is_long else "SHORT"
+        side = "LONG" if signal_type == "ENTRY_LONG" else "SHORT"
+        circle_emoji = "🟢" if side == "LONG" else "🔴"
+
+        if side == "LONG" and current_pos == "short":
+            close_res = close_okx_position(inst_id, "short")
+            if close_res.get("code") == "0":
+                send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт SHORT по `{inst_id}`\n• PnL: `{pnl_str}`")
+        elif side == "SHORT" and current_pos == "long":
+            close_res = close_okx_position(inst_id, "long")
+            if close_res.get("code") == "0":
+                send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт LONG по `{inst_id}`\n• PnL: `{pnl_str}`")
+
+        success, err_msg = execute_okx_trade(symbol, side, DEFAULT_MARGIN)
         
-        msg_text = (
-            f"{circle_emoji} *СИГНАЛ WYCKOFF: {side_code}*\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"• *Монета:* `{inst_id}`\n"
-            f"• *Паттерн:* `{pattern_name}`\n"
-            f"━━━━━━━━━━━━━━━━━━━"
-        )
-        
-        reply_markup = {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ Вход", "callback_data": f"enter_{side_code}_{symbol}"},
-                    {"text": "❌ Пропустить", "callback_data": f"skip_{symbol}"}
-                ]
-            ]
-        }
-        send_telegram_msg(msg_text, reply_markup=reply_markup)
+        if success:
+            send_telegram_msg(
+                f"{circle_emoji} *АВТО-ВХОД: {side}*\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"• *Инструмент:* `{inst_id}`\n"
+                f"• *Маржа:* `${DEFAULT_MARGIN} USDT`\n"
+                f"• *Паттерн:* `{pattern_name}`"
+            )
+        else:
+            send_telegram_msg(f"⚠️ *Ошибка открытия `{inst_id}`*\n• Причина: `{err_msg}`")
 
     return "OK", 200
 
 @app.route('/', methods=['POST', 'GET'])
-def index_root():
+def index():
     if request.method == 'GET':
         return "OKX Smart Bot is Running!", 200
-    return process_incoming_request(request)
-
-@app.route('/webhook', methods=['POST', 'GET'])
-def webhook_path():
-    return process_incoming_request(request)
-
-@app.route('/telegram-callback', methods=['POST', 'GET'])
-def telegram_callback_path():
-    return process_incoming_request(request)
+    return webhook()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
