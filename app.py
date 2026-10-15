@@ -21,8 +21,8 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 OKX_BASE_URL = "https://www.okx.com"
 
 RSI_TIMEFRAME = "15m"
-RSI_EXIT_LONG = 65.0
-RSI_EXIT_SHORT = 35.0
+RSI_EXIT_LONG = 70.0
+RSI_EXIT_SHORT = 30.0
 
 # Автоматическая маржа по умолчанию 1.0 USDT (можно переопределить через env DEFAULT_MARGIN)
 DEFAULT_MARGIN = float(os.environ.get("DEFAULT_MARGIN", "1.0"))
@@ -381,7 +381,7 @@ def webhook():
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-    # Фиксированный выход по RSI (без трейлинга)
+    # Фиксированный выход по RSI (70 для лонга, 30 для шорта)
     if current_pos:
         current_rsi = calculate_rsi14(inst_id)
         if current_rsi is not None:
