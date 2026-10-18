@@ -243,12 +243,25 @@ def parse_alert(text):
 
     text_lower = text_str.lower()
     
-    if "buy level retest" in text_lower:
+    # ВХОДЫ: Spring -> LONG, Upthrust / UTAD -> SHORT
+    if "spring" in text_lower:
         signal_type = "ENTRY_LONG"
-        pattern_name = "BUY_RETEST"
-    elif "sell level retest" in text_lower:
+        pattern_name = "SPRING"
+    elif "upthrust" in text_lower or "utad" in text_lower:
         signal_type = "ENTRY_SHORT"
-        pattern_name = "SELL_RETEST"
+        pattern_name = "UPTHRUST_UTAD"
+    
+    # ВЫХОДЫ ИЗ ЛОНГА (Buying Climax, Sign of Strength, Distribution entering phase b, Markup)
+    elif any(kw in text_lower for kw in ["buying climax", "sign of strength", "distribution entering phase b", "markup"]):
+        signal_type = "EXIT_LONG"
+        pattern_name = "WYCKOFF_EXIT_LONG"
+
+    # ВЫХОДЫ ИЗ ШОРТА (Selling Climax, Sign of Weakness, Accumulation entering phase b, Markdown)
+    elif any(kw in text_lower for kw in ["selling climax", "sign of weakness", "accumulation entering phase b", "markdown"]):
+        signal_type = "EXIT_SHORT"
+        pattern_name = "WYCKOFF_EXIT_SHORT"
+
+    # Сохраняем старые бэкап-триггеры на случай общих брекаутов
     elif "range breakout down" in text_lower:
         signal_type = "BREAKOUT_DOWN"
         pattern_name = "BREAKOUT_DOWN"
@@ -418,7 +431,21 @@ def webhook():
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-    # Стоп-лосс по Range Breakout
+    # Обработка парсинга выхода из лонга (Buying Climax, SOS, Distribution phase b, Markup)
+    if signal_type == "EXIT_LONG" and current_pos == "long":
+        close_res = close_okx_position(inst_id, "long")
+        if close_res.get("code") == "0":
+            send_telegram_msg(f"🛑 *ВЫХОД ИЗ ЛОНГА ({pattern_name})*\n• Инструмент: `{inst_id}`\n• PnL: `{pnl_str}`")
+        return "OK", 200
+
+    # Обработка парсинга выхода из шорта (Selling Climax, SOW, Accumulation phase b, Markdown)
+    if signal_type == "EXIT_SHORT" and current_pos == "short":
+        close_res = close_okx_position(inst_id, "short")
+        if close_res.get("code") == "0":
+            send_telegram_msg(f"🛑 *ВЫХОД ИЗ ШОРТА ({pattern_name})*\n• Инструмент: `{inst_id}`\n• PnL: `{pnl_str}`")
+        return "OK", 200
+
+    # Стоп-лосс по Range Breakout (оставляем для безопасности)
     if signal_type == "BREAKOUT_DOWN" and current_pos == "long":
         close_res = close_okx_position(inst_id, "long")
         if close_res.get("code") == "0":
@@ -431,7 +458,7 @@ def webhook():
             send_telegram_msg(f"🛑 *СТОП-ЛОСС (Breakout UP)*\n• Инструмент: `{inst_id}`\n• PnL: `{pnl_str}`")
         return "OK", 200
 
-    if signal_type in ["BREAKOUT_DOWN", "BREAKOUT_UP"]:
+    if signal_type in ["BREAKOUT_DOWN", "BREAKOUT_UP", "EXIT_LONG", "EXIT_SHORT"]:
         return "OK", 200
 
     # Автоматический вход по сигналу на DEFAULT_MARGIN (1 USDT) с разворотом
