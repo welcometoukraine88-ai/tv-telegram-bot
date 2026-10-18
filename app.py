@@ -148,7 +148,7 @@ def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
     return round(rsi, 2)
 
 def execute_okx_trade(symbol, side_type, margin_usdt):
-    clean_symbol = symbol.replace(".P", "").replace("USDT", "")
+    clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
     okx_side = "sell" if side_type == "SHORT" else "buy"
     pos_side = "short" if side_type == "SHORT" else "long"
@@ -217,29 +217,38 @@ def parse_alert(text):
 
     text_str = text if isinstance(text, str) else json.dumps(text)
 
+    # 1. Если есть двоеточие, берем часть до него (например: "XAUUSDT.P 15: Wyckoff Spring...")
     if ":" in text_str:
         parts = text_str.split(":", 1)
-        potential_symbol = parts[0].strip().replace('"', '').replace("'", "")
-        if len(potential_symbol) > 2 and ("USDT" in potential_symbol.upper() or ".P" in potential_symbol.upper() or len(potential_symbol) <= 12):
-            symbol = potential_symbol.upper()
-            text_str = parts[1]
+        potential_prefix = parts[0].strip().replace('"', '').replace("'", "")
+        
+        # Отсекаем пробел и цифры таймфрейма в конце (например, "XAUUSDT.P 15" -> "XAUUSDT.P")
+        clean_prefix_match = re.search(r'^([A-Za-z0-9_\-\.]+)(?:\s+\d+)?$', potential_prefix)
+        if clean_prefix_match:
+            candidate_sym = clean_prefix_match.group(1).upper()
+            if len(candidate_sym) > 2:
+                symbol = candidate_sym
 
-    if symbol == "UNKNOWN":
-        try:
-            data = json.loads(text_str)
-            if isinstance(data, dict):
-                raw_sym = data.get("instrument") or data.get("symbol") or data.get("ticker") or ""
-                if raw_sym:
-                    symbol = raw_sym.split(":")[-1].strip() if ":" in raw_sym else raw_sym.strip()
-        except Exception:
-            pass
+        text_str = parts[1]
 
+    # 2. Если не нашлось через двоеточие, ищем по общему паттерну
     if symbol == "UNKNOWN":
-        match = re.search(r'([A-Za-z0-9_]+(?:USDT|\.p|\.P))', text_str)
+        match = re.search(r'\b([A-Za-z0-9_]+(?:USDT|\.p|\.P|XAU))\b', text_str)
         if match:
             symbol = match.group(1).upper()
             if ":" in symbol:
                 symbol = symbol.split(":")[-1]
+
+    # Строго приводим к формату XAUUSDT.P
+    if symbol != "UNKNOWN":
+        symbol = symbol.split()[0].upper()
+        if not symbol.endswith(".P") and not symbol.endswith(".p"):
+            if "USDT" in symbol and not symbol.endswith("USDT.P"):
+                symbol = symbol.replace("USDT", "USDT.P")
+            elif "USDT" not in symbol:
+                symbol = f"{symbol}USDT.P"
+        else:
+            symbol = symbol.replace(".p", ".P")
 
     text_lower = text_str.lower()
     
@@ -341,7 +350,7 @@ def webhook():
                 parts = callback_data.split("_")
                 side = parts[1]
                 symbol = parts[2]
-                clean_symbol = symbol.replace(".P", "").replace("USDT", "")
+                clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("USDT", "")
                 inst_id = f"{clean_symbol}-USDT-SWAP"
 
                 PENDING_MARGIN_INPUT[chat_id] = {
@@ -420,7 +429,7 @@ def webhook():
     if not symbol or symbol == "UNKNOWN" or "{{" in symbol or signal_type == "UNKNOWN":
         return "OK", 200
 
-    clean_symbol = symbol.replace(".P", "").replace("USDT", "")
+    clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
 
     positions = get_okx_all_positions()
