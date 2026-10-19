@@ -99,6 +99,7 @@ def get_okx_all_positions():
                     "upl": float(pos.get("upl", 0.0)),
                     "uplRatio": float(pos.get("uplRatio", 0.0)) * 100,
                     "avgPx": float(pos.get("avgPx", 0.0)),
+                    "lever": pos.get("lever", "20"),
                     "sz": pos.get("pos")
                 })
     return positions
@@ -217,12 +218,10 @@ def parse_alert(text):
 
     text_str = text if isinstance(text, str) else json.dumps(text)
 
-    # 1. Если есть двоеточие, берем часть до него (например: "XAUUSDT.P 15: Wyckoff Spring...")
     if ":" in text_str:
         parts = text_str.split(":", 1)
         potential_prefix = parts[0].strip().replace('"', '').replace("'", "")
         
-        # Отсекаем пробел и цифры таймфрейма в конце (например, "XAUUSDT.P 15" -> "XAUUSDT.P")
         clean_prefix_match = re.search(r'^([A-Za-z0-9_\-\.]+)(?:\s+\d+)?$', potential_prefix)
         if clean_prefix_match:
             candidate_sym = clean_prefix_match.group(1).upper()
@@ -231,7 +230,6 @@ def parse_alert(text):
 
         text_str = parts[1]
 
-    # 2. Если не нашлось через двоеточие, ищем по общему паттерну
     if symbol == "UNKNOWN":
         match = re.search(r'\b([A-Za-z0-9_]+(?:USDT|\.p|\.P|XAU))\b', text_str)
         if match:
@@ -239,7 +237,6 @@ def parse_alert(text):
             if ":" in symbol:
                 symbol = symbol.split(":")[-1]
 
-    # Строго приводим к формату XAUUSDT.P
     if symbol != "UNKNOWN":
         symbol = symbol.split()[0].upper()
         if not symbol.endswith(".P") and not symbol.endswith(".p"):
@@ -252,7 +249,6 @@ def parse_alert(text):
 
     text_lower = text_str.lower()
     
-    # ВХОДЫ: Spring -> LONG, Upthrust / UTAD -> SHORT
     if "spring" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "SPRING"
@@ -260,17 +256,14 @@ def parse_alert(text):
         signal_type = "ENTRY_SHORT"
         pattern_name = "UPTHRUST_UTAD"
     
-    # ВЫХОДЫ ИЗ ЛОНГА (Buying Climax, Sign of Strength, Distribution entering phase b, Markup)
     elif any(kw in text_lower for kw in ["buying climax", "sign of strength", "distribution entering phase b", "markup"]):
         signal_type = "EXIT_LONG"
         pattern_name = "WYCKOFF_EXIT_LONG"
 
-    # ВЫХОДЫ ИЗ ШОРТА (Selling Climax, Sign of Weakness, Accumulation entering phase b, Markdown)
     elif any(kw in text_lower for kw in ["selling climax", "sign of weakness", "accumulation entering phase b", "markdown"]):
         signal_type = "EXIT_SHORT"
         pattern_name = "WYCKOFF_EXIT_SHORT"
 
-    # Сохраняем старые бэкап-триггеры на случай общих брекаутов
     elif "range breakout down" in text_lower:
         signal_type = "BREAKOUT_DOWN"
         pattern_name = "BREAKOUT_DOWN"
@@ -294,6 +287,8 @@ def scheduled_rsi_check():
         upl_ratio = pos.get("uplRatio", 0.0)
         pnl_sign = "+" if upl >= 0 else ""
         pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+        short_coin = inst_id.replace("-USDT-SWAP", "USDT.P")
+        icon = "✅" if upl >= 0 else "❌"
 
         current_rsi = calculate_rsi14(inst_id)
         if current_rsi is None:
@@ -304,14 +299,21 @@ def scheduled_rsi_check():
         if current_pos == "long" and current_rsi >= RSI_EXIT_LONG:
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
-                send_telegram_msg(f"🎯 *ПЛАНОВЫЙ ТЕЙК-ПРОФИТ (RSI: {current_rsi})*\n• Инструмент: `{inst_id}`\n• Направление: `LONG`\n• PnL: `{pnl_str}`")
+                send_telegram_msg(
+                    f"{icon} *Тейк-профит (RSI)*\n"
+                    f"• Монета: `{short_coin}`\n"
+                    f"• PnL: `{pnl_str}`"
+                )
 
         elif current_pos == "short" and current_rsi <= RSI_EXIT_SHORT:
             close_res = close_okx_position(inst_id, "short")
             if close_res.get("code") == "0":
-                send_telegram_msg(f"🎯 *ПЛАНОВЫЙ ТЕЙК-ПРОФИТ (RSI: {current_rsi})*\n• Инструмент: `{inst_id}`\n• Направление: `SHORT`\n• PnL: `{pnl_str}`")
+                send_telegram_msg(
+                    f"{icon} *Тейк-профит (RSI)*\n"
+                    f"• Монета: `{short_coin}`\n"
+                    f"• PnL: `{pnl_str}`"
+                )
 
-# Запуск фонового шедулера (проверка каждые 15 минут)
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=scheduled_rsi_check, trigger="interval", minutes=15)
 scheduler.start()
@@ -322,7 +324,6 @@ def webhook():
     
     data = request.get_json(silent=True)
     
-    # 1. Обработка Telegram (оставляем совместимость, если прилетит что-то из телеги)
     if data:
         print(f"📥 TELEGRAM JSON DATA: {json.dumps(data, ensure_ascii=False)}")
         
@@ -390,6 +391,7 @@ def webhook():
                         upl_ratio = pos_info.get("uplRatio", 0.0) if pos_info else 0.0
                         pnl_sign = "+" if upl >= 0 else ""
                         pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+                        short_coin = symbol
 
                         if side == "LONG" and current_pos == "short":
                             close_res = close_okx_position(inst_id, "short")
@@ -404,13 +406,16 @@ def webhook():
                         emoji = "🚀" if side == "LONG" else "🔻"
                         
                         if success:
+                            time.sleep(0.5)
+                            new_positions = get_okx_all_positions()
+                            new_pos = next((p for p in new_positions if p["instId"] == inst_id), None)
+                            active_lev = new_pos.get("lever", "20") if new_pos else "20"
                             send_telegram_msg(
-                                f"{emoji} *ОРДЕР УСПЕШНО ОТКРЫТ*\n"
-                                f"━━━━━━━━━━━━━━━━━━━\n"
-                                f"• *Инструмент:* `{inst_id}`\n"
-                                f"• *Тип:* `{side}`\n"
-                                f"• *Маржа:* `${margin_usdt} USDT`\n"
-                                f"• *Плечо:* `Макс (авто)`"
+                                f"{emoji} *Вход: {side}*\n"
+                                f"• Монета: `{short_coin}`\n"
+                                f"• Маржа: `${margin_usdt} USDT`\n"
+                                f"• Плечо: `{active_lev}x`\n"
+                                f"• Паттерн: `Manual`"
                             )
                         else:
                             send_telegram_msg(f"⚠️ *Ошибка открытия `{inst_id}`*\n• Причина: `{err_msg}`")
@@ -431,6 +436,7 @@ def webhook():
 
     clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
+    short_coin = symbol
 
     positions = get_okx_all_positions()
     pos_info = next((p for p in positions if p["instId"] == inst_id), None)
@@ -439,32 +445,49 @@ def webhook():
     upl_ratio = pos_info.get("uplRatio", 0.0) if pos_info else 0.0
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+    exit_icon = "✅" if upl >= 0 else "❌"
 
-    # Обработка парсинга выхода из лонга (Buying Climax, SOS, Distribution phase b, Markup)
+    # Обработка парсинга выхода из лонга
     if signal_type == "EXIT_LONG" and current_pos == "long":
         close_res = close_okx_position(inst_id, "long")
         if close_res.get("code") == "0":
-            send_telegram_msg(f"🛑 *ВЫХОД ИЗ ЛОНГА ({pattern_name})*\n• Инструмент: `{inst_id}`\n• PnL: `{pnl_str}`")
+            send_telegram_msg(
+                f"{exit_icon} *Тейк-профит ({pattern_name})*\n"
+                f"• Монета: `{short_coin}`\n"
+                f"• PnL: `{pnl_str}`"
+            )
         return "OK", 200
 
-    # Обработка парсинга выхода из шорта (Selling Climax, SOW, Accumulation phase b, Markdown)
+    # Обработка парсинга выхода из шорта
     if signal_type == "EXIT_SHORT" and current_pos == "short":
         close_res = close_okx_position(inst_id, "short")
         if close_res.get("code") == "0":
-            send_telegram_msg(f"🛑 *ВЫХОД ИЗ ШОРТА ({pattern_name})*\n• Инструмент: `{inst_id}`\n• PnL: `{pnl_str}`")
+            send_telegram_msg(
+                f"{exit_icon} *Тейк-профит ({pattern_name})*\n"
+                f"• Монета: `{short_coin}`\n"
+                f"• PnL: `{pnl_str}`"
+            )
         return "OK", 200
 
-    # Стоп-лосс по Range Breakout (оставляем для безопасности)
+    # Стоп-лосс по Range Breakout
     if signal_type == "BREAKOUT_DOWN" and current_pos == "long":
         close_res = close_okx_position(inst_id, "long")
         if close_res.get("code") == "0":
-            send_telegram_msg(f"🛑 *СТОП-ЛОСС (Breakout DOWN)*\n• Инструмент: `{inst_id}`\n• PnL: `{pnl_str}`")
+            send_telegram_msg(
+                f"{exit_icon} *Стоп-лосс (Breakout DOWN)*\n"
+                f"• Монета: `{short_coin}`\n"
+                f"• PnL: `{pnl_str}`"
+            )
         return "OK", 200
 
     if signal_type == "BREAKOUT_UP" and current_pos == "short":
         close_res = close_okx_position(inst_id, "short")
         if close_res.get("code") == "0":
-            send_telegram_msg(f"🛑 *СТОП-ЛОСС (Breakout UP)*\n• Инструмент: `{inst_id}`\n• PnL: `{pnl_str}`")
+            send_telegram_msg(
+                f"{exit_icon} *Стоп-лосс (Breakout UP)*\n"
+                f"• Монета: `{short_coin}`\n"
+                f"• PnL: `{pnl_str}`"
+            )
         return "OK", 200
 
     if signal_type in ["BREAKOUT_DOWN", "BREAKOUT_UP", "EXIT_LONG", "EXIT_SHORT"]:
@@ -487,15 +510,19 @@ def webhook():
         success, err_msg = execute_okx_trade(symbol, side, DEFAULT_MARGIN)
         
         if success:
+            time.sleep(0.5)
+            new_positions = get_okx_all_positions()
+            new_pos = next((p for p in new_positions if p["instId"] == inst_id), None)
+            active_lev = new_pos.get("lever", "20") if new_pos else "20"
             send_telegram_msg(
-                f"{circle_emoji} *АВТО-ВХОД: {side}*\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"• *Инструмент:* `{inst_id}`\n"
-                f"• *Маржа:* `${DEFAULT_MARGIN} USDT`\n"
-                f"• *Паттерн:* `{pattern_name}`"
+                f"{circle_emoji} *Вход: {side}*\n"
+                f"• Монета: `{short_coin}`\n"
+                f"• Маржа: `${DEFAULT_MARGIN} USDT`\n"
+                f"• Плечо: `{active_lev}x`\n"
+                f"• Паттерн: `{pattern_name}`"
             )
         else:
-            send_telegram_msg(f"⚠️ *Ошибка открытия `{inst_id}`*\n• Причина: `{err_msg}`")
+            send_telegram_msg(f"⚠️ *Ошибка открытия `{short_coin}`*\n• Причина: `{err_msg}`")
 
     return "OK", 200
 
