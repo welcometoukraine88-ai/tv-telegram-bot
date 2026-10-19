@@ -25,6 +25,9 @@ RSI_TIMEFRAME = "15m"
 RSI_EXIT_LONG = 70.0
 RSI_EXIT_SHORT = 30.0
 
+# Словарь для отслеживания времени открытия позиций: {inst_id: timestamp_открытия}
+POSITION_OPEN_TIMES = {}
+
 # Автоматическая маржа по умолчанию 1.0 USDT (можно переопределить через env DEFAULT_MARGIN)
 DEFAULT_MARGIN = float(os.environ.get("DEFAULT_MARGIN", "1.0"))
 
@@ -112,41 +115,52 @@ def close_okx_position(inst_id, pos_side):
     }
     return okx_request("POST", "/api/v5/trade/close-position", body)
 
-def calculate_rsi14(inst_id, timeframe=RSI_TIMEFRAME):
-    res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit=100")
+def calculate_rsi_history(inst_id, timeframe=RSI_TIMEFRAME, limit=30):
+    res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit={limit}")
     if res.get("code") != "0" or not res.get("data"):
-        return None
+        return []
 
     raw_candles = res["data"]
-    if len(raw_candles) < 30:
-        return None
+    if len(raw_candles) < 20:
+        return []
 
     candles = list(reversed(raw_candles))
     closes = [float(c[4]) for c in candles]
 
+    rsi_list = []
     changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
     gains = [max(c, 0.0) for c in changes]
     losses = [abs(min(c, 0.0)) for c in changes]
 
     length = 14
     if len(gains) < length:
-        return None
+        return []
 
     avg_gain = sum(gains[:length]) / length
     avg_loss = sum(losses[:length]) / length
 
+    # Считаем первый RSI
+    if avg_loss == 0:
+        rsi_list.append(100.0)
+    elif avg_gain == 0:
+        rsi_list.append(0.0)
+    else:
+        rs = avg_gain / avg_loss
+        rsi_list.append(round(100.0 - (100.0 / (1.0 + rs)), 2))
+
+    # Считаем для остальных баров сглаживанием Уайлдера
     for i in range(length, len(gains)):
         avg_gain = (avg_gain * (length - 1) + gains[i]) / length
         avg_loss = (avg_loss * (length - 1) + losses[i]) / length
+        if avg_loss == 0:
+            rsi_list.append(100.0)
+        elif avg_gain == 0:
+            rsi_list.append(0.0)
+        else:
+            rs = avg_gain / avg_loss
+            rsi_list.append(round(100.0 - (100.0 / (1.0 + rs)), 2))
 
-    if avg_loss == 0:
-        return 100.0
-    if avg_gain == 0:
-        return 0.0
-
-    rs = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return round(rsi, 2)
+    return rsi_list
 
 def execute_okx_trade(symbol, side_type, margin_usdt):
     clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("USDT", "")
@@ -206,6 +220,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     res = okx_request("POST", "/api/v5/trade/order", order_body)
 
     if res.get("code") == "0":
+        POSITION_OPEN_TIMES[inst_id] = time.time()
         return True, "Success"
     else:
         msg = res.get("data", [{}])[0].get("sMsg") or res.get("msg")
@@ -273,12 +288,15 @@ def parse_alert(text):
 
     return symbol, signal_type, pattern_name
 
-# --- ФОНОВАЯ ПРОВЕРКА RSI КАЖДЫЕ 15 МИНУТ ---
+# --- ФОНОВАЯ ПРОВЕРКА RSI (ТЕЙК-ПРОФИТЫ И СТОП-ЛОССЫ) КАЖДЫЕ 15 МИНУТ ---
 def scheduled_rsi_check():
     print("⏰ Запуск плановой проверки RSI для открытых позиций...")
     positions = get_okx_all_positions()
     if not positions:
         return
+
+    current_time = time.time()
+    bar_duration = 15 * 60  # 15 минут в секундах
 
     for pos in positions:
         inst_id = pos["instId"]
@@ -290,13 +308,21 @@ def scheduled_rsi_check():
         short_coin = inst_id.replace("-USDT-SWAP", "USDT.P")
         icon = "✅" if upl >= 0 else "❌"
 
-        current_rsi = calculate_rsi14(inst_id)
-        if current_rsi is None:
+        # Проверка защиты на первые 2 бара (30 минут для таймфрейма 15m)
+        open_time = POSITION_OPEN_TIMES.get(inst_id, 0)
+        bars_passed = (current_time - open_time) / bar_duration if open_time > 0 else 999.0
+
+        rsi_history = calculate_rsi_history(inst_id, RSI_TIMEFRAME, limit=10)
+        if len(rsi_history) < 2:
             continue
 
-        print(f"📊 {inst_id} ({current_pos.upper()}): текущий RSI = {current_rsi}")
+        prev_rsi = rsi_history[-2]
+        curr_rsi = rsi_history[-1]
 
-        if current_pos == "long" and current_rsi >= RSI_EXIT_LONG:
+        print(f"📊 {inst_id} ({current_pos.upper()}): prev_RSI = {prev_rsi}, curr_RSI = {curr_rsi}, прошло баров: {bars_passed:.1f}")
+
+        # Тейк-профиты по старым правилам RSI
+        if current_pos == "long" and curr_rsi >= RSI_EXIT_LONG:
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
                 send_telegram_msg(
@@ -304,8 +330,10 @@ def scheduled_rsi_check():
                     f"• Монета: `{short_coin}`\n"
                     f"• PnL: `{pnl_str}`"
                 )
+                POSITION_OPEN_TIMES.pop(inst_id, None)
+                continue
 
-        elif current_pos == "short" and current_rsi <= RSI_EXIT_SHORT:
+        elif current_pos == "short" and curr_rsi <= RSI_EXIT_SHORT:
             close_res = close_okx_position(inst_id, "short")
             if close_res.get("code") == "0":
                 send_telegram_msg(
@@ -313,6 +341,34 @@ def scheduled_rsi_check():
                     f"• Монета: `{short_coin}`\n"
                     f"• PnL: `{pnl_str}`"
                 )
+                POSITION_OPEN_TIMES.pop(inst_id, None)
+                continue
+
+        # Стоп-лосс (активируется только если прошло >= 2 баров)
+        if bars_passed >= 2.0:
+            # Стоп-лосс для LONG: RSI пересекает сверху вниз значение 30 (prev >= 30 и curr < 30)
+            if current_pos == "long" and prev_rsi >= 30.0 and curr_rsi < 30.0:
+                close_res = close_okx_position(inst_id, "long")
+                if close_res.get("code") == "0":
+                    send_telegram_msg(
+                        f"{icon} *Стоп-лосс (RSI)*\n"
+                        f"• Монета: `{short_coin}`\n"
+                        f"• PnL: `{pnl_str}`"
+                    )
+                    POSITION_OPEN_TIMES.pop(inst_id, None)
+                    continue
+
+            # Стоп-лосс для SHORT: RSI пересекает снизу вверх значение 70 (prev <= 70 и curr > 70)
+            elif current_pos == "short" and prev_rsi <= 70.0 and curr_rsi > 70.0:
+                close_res = close_okx_position(inst_id, "short")
+                if close_res.get("code") == "0":
+                    send_telegram_msg(
+                        f"{icon} *Стоп-лосс (RSI)*\n"
+                        f"• Монета: `{short_coin}`\n"
+                        f"• PnL: `{pnl_str}`"
+                    )
+                    POSITION_OPEN_TIMES.pop(inst_id, None)
+                    continue
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=scheduled_rsi_check, trigger="interval", minutes=15)
@@ -397,10 +453,12 @@ def webhook():
                             close_res = close_okx_position(inst_id, "short")
                             if close_res.get("code") == "0":
                                 send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт SHORT по `{inst_id}`\n• PnL: `{pnl_str}`")
+                                POSITION_OPEN_TIMES.pop(inst_id, None)
                         elif side == "SHORT" and current_pos == "long":
                             close_res = close_okx_position(inst_id, "long")
                             if close_res.get("code") == "0":
                                 send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт LONG по `{inst_id}`\n• PnL: `{pnl_str}`")
+                                POSITION_OPEN_TIMES.pop(inst_id, None)
 
                         success, err_msg = execute_okx_trade(symbol, side, margin_usdt)
                         emoji = "🚀" if side == "LONG" else "🔻"
@@ -456,6 +514,7 @@ def webhook():
                 f"• Монета: `{short_coin}`\n"
                 f"• PnL: `{pnl_str}`"
             )
+            POSITION_OPEN_TIMES.pop(inst_id, None)
         return "OK", 200
 
     # Обработка парсинга выхода из шорта
@@ -467,6 +526,7 @@ def webhook():
                 f"• Монета: `{short_coin}`\n"
                 f"• PnL: `{pnl_str}`"
             )
+            POSITION_OPEN_TIMES.pop(inst_id, None)
         return "OK", 200
 
     # Стоп-лосс по Range Breakout
@@ -478,6 +538,7 @@ def webhook():
                 f"• Монета: `{short_coin}`\n"
                 f"• PnL: `{pnl_str}`"
             )
+            POSITION_OPEN_TIMES.pop(inst_id, None)
         return "OK", 200
 
     if signal_type == "BREAKOUT_UP" and current_pos == "short":
@@ -488,6 +549,7 @@ def webhook():
                 f"• Монета: `{short_coin}`\n"
                 f"• PnL: `{pnl_str}`"
             )
+            POSITION_OPEN_TIMES.pop(inst_id, None)
         return "OK", 200
 
     if signal_type in ["BREAKOUT_DOWN", "BREAKOUT_UP", "EXIT_LONG", "EXIT_SHORT"]:
@@ -502,10 +564,12 @@ def webhook():
             close_res = close_okx_position(inst_id, "short")
             if close_res.get("code") == "0":
                 send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт SHORT по `{inst_id}`\n• PnL: `{pnl_str}`")
+                POSITION_OPEN_TIMES.pop(inst_id, None)
         elif side == "SHORT" and current_pos == "long":
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
                 send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт LONG по `{inst_id}`\n• PnL: `{pnl_str}`")
+                POSITION_OPEN_TIMES.pop(inst_id, None)
 
         success, err_msg = execute_okx_trade(symbol, side, DEFAULT_MARGIN)
         
