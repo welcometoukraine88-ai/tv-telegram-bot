@@ -9,6 +9,7 @@ import hashlib
 from flask import Flask, request
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 app = Flask(__name__)
 
@@ -369,7 +370,11 @@ def scheduled_rsi_check():
                 continue
 
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=scheduled_rsi_check, trigger="interval", minutes=15)
+# Запуск строго в 0, 15, 30 и 45 минут каждого часа на 5-й секунде (синхронно с закрытием свечей)
+scheduler.add_job(
+    func=scheduled_rsi_check, 
+    trigger=CronTrigger(minute="0,15,30,45", second="5")
+)
 scheduler.start()
 
 @app.route('/webhook', methods=['POST', 'GET'])
