@@ -317,7 +317,7 @@ def scheduled_rsi_check():
         short_coin = inst_id.replace("-USDT-SWAP", "USDT.P")
         icon = "✅" if upl >= 0 else "❌"
 
-        rsi_history = calculate_rsi_history(inst_id, RSI_TIMEFRAME, limit=10)
+        rsi_history = calculate_rsi_history(inst_id, RSI_TIMEFRAME, limit=30)
         if len(rsi_history) < 2:
             continue
 
