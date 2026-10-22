@@ -25,9 +25,6 @@ RSI_TIMEFRAME = "15m"
 RSI_EXIT_LONG = 70.0
 RSI_EXIT_SHORT = 30.0
 
-# Словарь для отслеживания времени открытия позиций: {inst_id: timestamp_открытия}
-POSITION_OPEN_TIMES = {}
-
 # Автоматическая маржа по умолчанию 1.0 USDT (можно переопределить через env DEFAULT_MARGIN)
 DEFAULT_MARGIN = float(os.environ.get("DEFAULT_MARGIN", "1.0"))
 
@@ -139,7 +136,6 @@ def calculate_rsi_history(inst_id, timeframe=RSI_TIMEFRAME, limit=30):
     avg_gain = sum(gains[:length]) / length
     avg_loss = sum(losses[:length]) / length
 
-    # Считаем первый RSI
     if avg_loss == 0:
         rsi_list.append(100.0)
     elif avg_gain == 0:
@@ -148,7 +144,6 @@ def calculate_rsi_history(inst_id, timeframe=RSI_TIMEFRAME, limit=30):
         rs = avg_gain / avg_loss
         rsi_list.append(round(100.0 - (100.0 / (1.0 + rs)), 2))
 
-    # Считаем для остальных баров сглаживанием Уайлдера
     for i in range(length, len(gains)):
         avg_gain = (avg_gain * (length - 1) + gains[i]) / length
         avg_loss = (avg_loss * (length - 1) + losses[i]) / length
@@ -220,7 +215,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     res = okx_request("POST", "/api/v5/trade/order", order_body)
 
     if res.get("code") == "0":
-        POSITION_OPEN_TIMES[inst_id] = time.time()
         return True, "Success"
     else:
         msg = res.get("data", [{}])[0].get("sMsg") or res.get("msg")
@@ -266,25 +260,43 @@ def parse_alert(text):
     
     if "spring" in text_lower:
         signal_type = "ENTRY_LONG"
-        pattern_name = "SPRING"
+        pattern_name = "Spring"
     elif "upthrust" in text_lower or "utad" in text_lower:
         signal_type = "ENTRY_SHORT"
-        pattern_name = "UPTHRUST_UTAD"
+        pattern_name = "Upthrust / UTAD"
     
-    elif any(kw in text_lower for kw in ["buying climax", "sign of strength", "distribution entering phase b", "markup"]):
+    elif "buying climax" in text_lower:
         signal_type = "EXIT_LONG"
-        pattern_name = "WYCKOFF_EXIT_LONG"
+        pattern_name = "Buying Climax"
+    elif "sign of strength" in text_lower:
+        signal_type = "EXIT_LONG"
+        pattern_name = "Sign of Strength"
+    elif "distribution entering phase b" in text_lower:
+        signal_type = "EXIT_LONG"
+        pattern_name = "Distribution entering Phase B"
+    elif "markup" in text_lower:
+        signal_type = "EXIT_LONG"
+        pattern_name = "Markup"
 
-    elif any(kw in text_lower for kw in ["selling climax", "sign of weakness", "accumulation entering phase b", "markdown"]):
+    elif "selling climax" in text_lower:
         signal_type = "EXIT_SHORT"
-        pattern_name = "WYCKOFF_EXIT_SHORT"
+        pattern_name = "Selling Climax"
+    elif "sign of weakness" in text_lower:
+        signal_type = "EXIT_SHORT"
+        pattern_name = "Sign of Weakness"
+    elif "accumulation entering phase b" in text_lower:
+        signal_type = "EXIT_SHORT"
+        pattern_name = "Accumulation entering Phase B"
+    elif "markdown" in text_lower:
+        signal_type = "EXIT_SHORT"
+        pattern_name = "Markdown"
 
     elif "range breakout down" in text_lower:
         signal_type = "BREAKOUT_DOWN"
-        pattern_name = "BREAKOUT_DOWN"
+        pattern_name = "Range Breakout Down"
     elif "range breakout up" in text_lower:
         signal_type = "BREAKOUT_UP"
-        pattern_name = "BREAKOUT_UP"
+        pattern_name = "Range Breakout Up"
 
     return symbol, signal_type, pattern_name
 
@@ -294,9 +306,6 @@ def scheduled_rsi_check():
     positions = get_okx_all_positions()
     if not positions:
         return
-
-    current_time = time.time()
-    bar_duration = 15 * 60  # 15 минут в секундах
 
     for pos in positions:
         inst_id = pos["instId"]
@@ -308,10 +317,6 @@ def scheduled_rsi_check():
         short_coin = inst_id.replace("-USDT-SWAP", "USDT.P")
         icon = "✅" if upl >= 0 else "❌"
 
-        # Проверка защиты на первые 2 бара (30 минут для таймфрейма 15m)
-        open_time = POSITION_OPEN_TIMES.get(inst_id, 0)
-        bars_passed = (current_time - open_time) / bar_duration if open_time > 0 else 999.0
-
         rsi_history = calculate_rsi_history(inst_id, RSI_TIMEFRAME, limit=10)
         if len(rsi_history) < 2:
             continue
@@ -319,9 +324,9 @@ def scheduled_rsi_check():
         prev_rsi = rsi_history[-2]
         curr_rsi = rsi_history[-1]
 
-        print(f"📊 {inst_id} ({current_pos.upper()}): prev_RSI = {prev_rsi}, curr_RSI = {curr_rsi}, прошло баров: {bars_passed:.1f}")
+        print(f"📊 {inst_id} ({current_pos.upper()}): prev_RSI = {prev_rsi}, curr_RSI = {curr_rsi}")
 
-        # Тейк-профиты по старым правилам RSI
+        # 1. Тейк-профиты по RSI
         if current_pos == "long" and curr_rsi >= RSI_EXIT_LONG:
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
@@ -330,7 +335,6 @@ def scheduled_rsi_check():
                     f"• Монета: `{short_coin}`\n"
                     f"• PnL: `{pnl_str}`"
                 )
-                POSITION_OPEN_TIMES.pop(inst_id, None)
                 continue
 
         elif current_pos == "short" and curr_rsi <= RSI_EXIT_SHORT:
@@ -341,34 +345,28 @@ def scheduled_rsi_check():
                     f"• Монета: `{short_coin}`\n"
                     f"• PnL: `{pnl_str}`"
                 )
-                POSITION_OPEN_TIMES.pop(inst_id, None)
                 continue
 
-        # Стоп-лосс (активируется только если прошло >= 2 баров)
-        if bars_passed >= 2.0:
-            # Стоп-лосс для LONG: RSI пересекает сверху вниз значение 30 (prev >= 30 и curr < 30)
-            if current_pos == "long" and prev_rsi >= 30.0 and curr_rsi < 30.0:
-                close_res = close_okx_position(inst_id, "long")
-                if close_res.get("code") == "0":
-                    send_telegram_msg(
-                        f"{icon} *Стоп-лосс (RSI)*\n"
-                        f"• Монета: `{short_coin}`\n"
-                        f"• PnL: `{pnl_str}`"
-                    )
-                    POSITION_OPEN_TIMES.pop(inst_id, None)
-                    continue
+        # 2. Строгий стоп-лосс по пересечению RSI (прошлый и текущий бар)
+        if current_pos == "long" and prev_rsi >= 30.0 and curr_rsi < 30.0:
+            close_res = close_okx_position(inst_id, "long")
+            if close_res.get("code") == "0":
+                send_telegram_msg(
+                    f"{icon} *Стоп-лосс (RSI)*\n"
+                    f"• Монета: `{short_coin}`\n"
+                    f"• PnL: `{pnl_str}`"
+                )
+                continue
 
-            # Стоп-лосс для SHORT: RSI пересекает снизу вверх значение 70 (prev <= 70 и curr > 70)
-            elif current_pos == "short" and prev_rsi <= 70.0 and curr_rsi > 70.0:
-                close_res = close_okx_position(inst_id, "short")
-                if close_res.get("code") == "0":
-                    send_telegram_msg(
-                        f"{icon} *Стоп-лосс (RSI)*\n"
-                        f"• Монета: `{short_coin}`\n"
-                        f"• PnL: `{pnl_str}`"
-                    )
-                    POSITION_OPEN_TIMES.pop(inst_id, None)
-                    continue
+        elif current_pos == "short" and prev_rsi <= 70.0 and curr_rsi > 70.0:
+            close_res = close_okx_position(inst_id, "short")
+            if close_res.get("code") == "0":
+                send_telegram_msg(
+                    f"{icon} *Стоп-лосс (RSI)*\n"
+                    f"• Монета: `{short_coin}`\n"
+                    f"• PnL: `{pnl_str}`"
+                )
+                continue
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=scheduled_rsi_check, trigger="interval", minutes=15)
@@ -453,12 +451,10 @@ def webhook():
                             close_res = close_okx_position(inst_id, "short")
                             if close_res.get("code") == "0":
                                 send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт SHORT по `{inst_id}`\n• PnL: `{pnl_str}`")
-                                POSITION_OPEN_TIMES.pop(inst_id, None)
                         elif side == "SHORT" and current_pos == "long":
                             close_res = close_okx_position(inst_id, "long")
                             if close_res.get("code") == "0":
                                 send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт LONG по `{inst_id}`\n• PnL: `{pnl_str}`")
-                                POSITION_OPEN_TIMES.pop(inst_id, None)
 
                         success, err_msg = execute_okx_trade(symbol, side, margin_usdt)
                         emoji = "🚀" if side == "LONG" else "🔻"
@@ -510,11 +506,10 @@ def webhook():
         close_res = close_okx_position(inst_id, "long")
         if close_res.get("code") == "0":
             send_telegram_msg(
-                f"{exit_icon} *Тейк-профит ({pattern_name})*\n"
+                f"{exit_icon} *Выход ({pattern_name})*\n"
                 f"• Монета: `{short_coin}`\n"
                 f"• PnL: `{pnl_str}`"
             )
-            POSITION_OPEN_TIMES.pop(inst_id, None)
         return "OK", 200
 
     # Обработка парсинга выхода из шорта
@@ -522,11 +517,10 @@ def webhook():
         close_res = close_okx_position(inst_id, "short")
         if close_res.get("code") == "0":
             send_telegram_msg(
-                f"{exit_icon} *Тейк-профит ({pattern_name})*\n"
+                f"{exit_icon} *Выход ({pattern_name})*\n"
                 f"• Монета: `{short_coin}`\n"
                 f"• PnL: `{pnl_str}`"
             )
-            POSITION_OPEN_TIMES.pop(inst_id, None)
         return "OK", 200
 
     # Стоп-лосс по Range Breakout
@@ -534,22 +528,20 @@ def webhook():
         close_res = close_okx_position(inst_id, "long")
         if close_res.get("code") == "0":
             send_telegram_msg(
-                f"{exit_icon} *Стоп-лосс (Breakout DOWN)*\n"
+                f"{exit_icon} *Стоп-лосс ({pattern_name})*\n"
                 f"• Монета: `{short_coin}`\n"
                 f"• PnL: `{pnl_str}`"
             )
-            POSITION_OPEN_TIMES.pop(inst_id, None)
         return "OK", 200
 
     if signal_type == "BREAKOUT_UP" and current_pos == "short":
         close_res = close_okx_position(inst_id, "short")
         if close_res.get("code") == "0":
             send_telegram_msg(
-                f"{exit_icon} *Стоп-лосс (Breakout UP)*\n"
+                f"{exit_icon} *Стоп-лосс ({pattern_name})*\n"
                 f"• Монета: `{short_coin}`\n"
                 f"• PnL: `{pnl_str}`"
             )
-            POSITION_OPEN_TIMES.pop(inst_id, None)
         return "OK", 200
 
     if signal_type in ["BREAKOUT_DOWN", "BREAKOUT_UP", "EXIT_LONG", "EXIT_SHORT"]:
@@ -564,12 +556,10 @@ def webhook():
             close_res = close_okx_position(inst_id, "short")
             if close_res.get("code") == "0":
                 send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт SHORT по `{inst_id}`\n• PnL: `{pnl_str}`")
-                POSITION_OPEN_TIMES.pop(inst_id, None)
         elif side == "SHORT" and current_pos == "long":
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
                 send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт LONG по `{inst_id}`\n• PnL: `{pnl_str}`")
-                POSITION_OPEN_TIMES.pop(inst_id, None)
 
         success, err_msg = execute_okx_trade(symbol, side, DEFAULT_MARGIN)
         
