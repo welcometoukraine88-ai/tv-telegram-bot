@@ -294,9 +294,9 @@ def parse_alert(text):
 
     return symbol, signal_type, pattern_name
 
-# --- ФОНОВАЯ ПРОВЕРКА (РЕДУКС СТОП-ЛОССОВ И ТЕЙК-ПРОФИТОВ) КАЖДЫЕ 15 МИНУТ ---
+# --- ФОНОВАЯ ПРОВЕРКА (ЖЕСТКИЙ СТОП 5% + ТЕЙК-ПРОФИТЫ RSI) КАЖДЫЕ 15 МИНУТ ---
 def scheduled_rsi_check():
-    print("⏰ Запуск плановой проверки позиций (RSI + Жесткий стоп 5%)...")
+    print("⏰ Запуск плановой проверки позиций (Жесткий стоп 5% + Тейк-профиты RSI)...")
     positions = get_okx_all_positions()
     if not positions:
         return
@@ -325,7 +325,6 @@ def scheduled_rsi_check():
             price_diff_pct = 0.0
             if current_pos == "long":
                 price_diff_pct = ((current_price - avg_px) / avg_px) * 100
-                # Если цена упала на 5% и более от входа — жесткий стоп
                 if price_diff_pct <= -5.0:
                     close_res = close_okx_position(inst_id, "long")
                     if close_res.get("code") == "0":
@@ -338,7 +337,6 @@ def scheduled_rsi_check():
                         continue
             elif current_pos == "short":
                 price_diff_pct = ((avg_px - current_price) / avg_px) * 100
-                # Если цена выросла на 5% и более от входа — жесткий стоп
                 if price_diff_pct <= -5.0:
                     close_res = close_okx_position(inst_id, "short")
                     if close_res.get("code") == "0":
@@ -350,7 +348,7 @@ def scheduled_rsi_check():
                         )
                         continue
 
-        # 2. Проверка RSI по строгому кроссоверу баров
+        # 2. Проверка Тейк-профитов по RSI
         rsi_history = calculate_rsi_history(inst_id, RSI_TIMEFRAME, limit=30)
         if len(rsi_history) < 2:
             continue
@@ -360,7 +358,6 @@ def scheduled_rsi_check():
 
         print(f"📊 {inst_id} ({current_pos.upper()}): prev_RSI = {prev_rsi}, curr_RSI = {curr_rsi}")
 
-        # Тейк-профиты по RSI
         if current_pos == "long" and curr_rsi >= RSI_EXIT_LONG:
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
@@ -376,27 +373,6 @@ def scheduled_rsi_check():
             if close_res.get("code") == "0":
                 send_telegram_msg(
                     f"{icon} *Тейк-профит (RSI)*\n"
-                    f"• Монета: `{short_coin}`\n"
-                    f"• PnL: `{pnl_str}`"
-                )
-                continue
-
-        # Строгий стоп-лосс по пересечению RSI (прошлый и текущий бар — ровно как ты требовал)
-        if current_pos == "long" and prev_rsi >= 30.0 and curr_rsi < 30.0:
-            close_res = close_okx_position(inst_id, "long")
-            if close_res.get("code") == "0":
-                send_telegram_msg(
-                    f"{icon} *Стоп-лосс (RSI Кроссовер)*\n"
-                    f"• Монета: `{short_coin}`\n"
-                    f"• PnL: `{pnl_str}`"
-                )
-                continue
-
-        elif current_pos == "short" and prev_rsi <= 70.0 and curr_rsi > 70.0:
-            close_res = close_okx_position(inst_id, "short")
-            if close_res.get("code") == "0":
-                send_telegram_msg(
-                    f"{icon} *Стоп-лосс (RSI Кроссовер)*\n"
                     f"• Монета: `{short_coin}`\n"
                     f"• PnL: `{pnl_str}`"
                 )
