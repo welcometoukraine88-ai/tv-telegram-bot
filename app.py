@@ -294,9 +294,9 @@ def parse_alert(text):
 
     return symbol, signal_type, pattern_name
 
-# --- ФОНОВАЯ ПРОВЕРКА (ЖЕСТКИЙ СТОП 5% + ТЕЙК-ПРОФИТЫ RSI) КАЖДЫЕ 15 МИНУТ ---
+# --- ФОНОВАЯ ПРОВЕРКА (ЖЕСТКИЙ СТОП 10% + ТЕЙК-ПРОФИТЫ RSI) КАЖДЫЕ 15 МИНУТ ---
 def scheduled_rsi_check():
-    print("⏰ Запуск плановой проверки позиций (Жесткий стоп 5% + Тейк-профиты RSI)...")
+    print("⏰ Запуск плановой проверки позиций (Жесткий стоп 10% + Тейк-профиты RSI)...")
     positions = get_okx_all_positions()
     if not positions:
         return
@@ -312,7 +312,7 @@ def scheduled_rsi_check():
         short_coin = inst_id.replace("-USDT-SWAP", "USDT.P")
         icon = "✅" if upl >= 0 else "❌"
 
-        # 1. Проверка жесткого стоп-лосса в 5% движения цены против позиции
+        # 1. Проверка жесткого стоп-лосса в 10% движения цены против позиции
         current_price = 0.0
         try:
             ticker_res = okx_request("GET", f"/api/v5/market/ticker?instId={inst_id}")
@@ -325,11 +325,11 @@ def scheduled_rsi_check():
             price_diff_pct = 0.0
             if current_pos == "long":
                 price_diff_pct = ((current_price - avg_px) / avg_px) * 100
-                if price_diff_pct <= -5.0:
+                if price_diff_pct <= -10.0:
                     close_res = close_okx_position(inst_id, "long")
                     if close_res.get("code") == "0":
                         send_telegram_msg(
-                            f"❌ *Жесткий стоп-лосс (5% цены)*\n"
+                            f"❌ *Жесткий стоп-лосс (10% цены)*\n"
                             f"• Монета: `{short_coin}`\n"
                             f"• Убыток по цене: `{price_diff_pct:.2f}%`\n"
                             f"• PnL: `{pnl_str}`"
@@ -337,11 +337,11 @@ def scheduled_rsi_check():
                         continue
             elif current_pos == "short":
                 price_diff_pct = ((avg_px - current_price) / avg_px) * 100
-                if price_diff_pct <= -5.0:
+                if price_diff_pct <= -10.0:
                     close_res = close_okx_position(inst_id, "short")
                     if close_res.get("code") == "0":
                         send_telegram_msg(
-                            f"❌ *Жесткий стоп-лосс (5% цены)*\n"
+                            f"❌ *Жесткий стоп-лосс (10% цены)*\n"
                             f"• Монета: `{short_coin}`\n"
                             f"• Рост против шорта: `{abs(price_diff_pct):.2f}%`\n"
                             f"• PnL: `{pnl_str}`"
