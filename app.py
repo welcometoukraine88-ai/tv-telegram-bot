@@ -22,7 +22,7 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 
 OKX_BASE_URL = "https://www.okx.com"
 
-RSI_TIMEFRAME = "15m"
+RSI_TIMEFRAME = "1h"
 RSI_EXIT_LONG = 70.0
 RSI_EXIT_SHORT = 30.0
 
@@ -294,9 +294,9 @@ def parse_alert(text):
 
     return symbol, signal_type, pattern_name
 
-# --- ФОНОВАЯ ПРОВЕРКА (ЖЕСТКИЙ СТОП 10% + ТЕЙК-ПРОФИТЫ RSI) КАЖДЫЕ 15 МИНУТ ---
+# --- ФОНОВАЯ ПРОВЕРКА (ЖЕСТКИЙ СТОП 10% + ТЕЙК-ПРОФИТЫ RSI ПО ВОЗВРАТУ НА 1h) КАЖДЫЕ 15 МИНУТ ---
 def scheduled_rsi_check():
-    print("⏰ Запуск плановой проверки позиций (Жесткий стоп 10% + Тейк-профиты RSI)...")
+    print("⏰ Запуск плановой проверки позиций (Жесткий стоп 10% + Тейк-профиты RSI 1h)...")
     positions = get_okx_all_positions()
     if not positions:
         return
@@ -348,7 +348,7 @@ def scheduled_rsi_check():
                         )
                         continue
 
-        # 2. Проверка Тейк-профитов по RSI
+        # 2. Проверка Тейк-профитов по RSI (момент возврата обратно в зону на 1h ТФ)
         rsi_history = calculate_rsi_history(inst_id, RSI_TIMEFRAME, limit=30)
         if len(rsi_history) < 2:
             continue
@@ -358,22 +358,24 @@ def scheduled_rsi_check():
 
         print(f"📊 {inst_id} ({current_pos.upper()}): prev_RSI = {prev_rsi}, curr_RSI = {curr_rsi}")
 
-        if current_pos == "long" and curr_rsi >= RSI_EXIT_LONG:
+        if current_pos == "long" and prev_rsi >= RSI_EXIT_LONG and curr_rsi < RSI_EXIT_LONG:
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
                 send_telegram_msg(
-                    f"{icon} *Тейк-профит (RSI)*\n"
+                    f"{icon} *Тейк-профит (RSI 1h Возврат)*\n"
                     f"• Монета: `{short_coin}`\n"
+                    f"• RSI пересек 70 вниз: `{prev_rsi} ➔ {curr_rsi}`\n"
                     f"• PnL: `{pnl_str}`"
                 )
                 continue
 
-        elif current_pos == "short" and curr_rsi <= RSI_EXIT_SHORT:
+        elif current_pos == "short" and prev_rsi <= RSI_EXIT_SHORT and curr_rsi > RSI_EXIT_SHORT:
             close_res = close_okx_position(inst_id, "short")
             if close_res.get("code") == "0":
                 send_telegram_msg(
-                    f"{icon} *Тейк-профит (RSI)*\n"
+                    f"{icon} *Тейк-профит (RSI 1h Возврат)*\n"
                     f"• Монета: `{short_coin}`\n"
+                    f"• RSI пересек 30 вверх: `{prev_rsi} ➔ {curr_rsi}`\n"
                     f"• PnL: `{pnl_str}`"
                 )
                 continue
