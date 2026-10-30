@@ -294,9 +294,9 @@ def parse_alert(text):
 
     return symbol, signal_type, pattern_name
 
-# --- ФОНОВАЯ ПРОВЕРКА (ЖЕСТКИЙ СТОП 10% + ТЕЙК-ПРОФИТЫ RSI) КАЖДЫЕ 15 МИНУТ ---
+# --- ФОНОВАЯ ПРОВЕРКА (ЖЕСТКИЙ СТОП 10% + ТЕЙК-ПРОФИТЫ RSI ТОЛЬКО В ПЛЮСЕ) КАЖДЫЕ 15 МИНУТ ---
 def scheduled_rsi_check():
-    print("⏰ Запуск плановой проверки позиций (Жесткий стоп 10% + Тейк-профиты RSI)...")
+    print("⏰ Запуск плановой проверки позиций (Жесткий стоп 10% + Тейк-профиты RSI при upl >= 0)...")
     positions = get_okx_all_positions()
     if not positions:
         return
@@ -348,7 +348,11 @@ def scheduled_rsi_check():
                         )
                         continue
 
-        # 2. Проверка Тейк-профитов по RSI
+        # 2. Проверка Тейк-профитов по RSI (строго при условии, что позиция в плюсе upl >= 0)
+        if upl < 0:
+            print(f"📊 {inst_id} ({current_pos.upper()}): позиция в просадке (PnL: {pnl_str}), RSI-тейк пропущен.")
+            continue
+
         rsi_history = calculate_rsi_history(inst_id, RSI_TIMEFRAME, limit=30)
         if len(rsi_history) < 2:
             continue
