@@ -262,41 +262,18 @@ def parse_alert(text):
     if "spring" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "Spring"
-    elif "upthrust" in text_lower or "utad" in text_lower:
-        signal_type = "ENTRY_SHORT"
-        pattern_name = "Upthrust / UTAD"
-    
-    elif "buying climax" in text_lower:
-        signal_type = "EXIT_LONG"
-        pattern_name = "Buying Climax"
-    elif "sign of strength" in text_lower:
-        signal_type = "EXIT_LONG"
-        pattern_name = "Sign of Strength"
-    elif "distribution entering phase b" in text_lower:
-        signal_type = "EXIT_LONG"
-        pattern_name = "Distribution entering Phase B"
-    elif "markup" in text_lower:
-        signal_type = "EXIT_LONG"
-        pattern_name = "Markup"
-
     elif "selling climax" in text_lower:
-        signal_type = "EXIT_SHORT"
+        signal_type = "ENTRY_LONG"
         pattern_name = "Selling Climax"
-    elif "sign of weakness" in text_lower:
-        signal_type = "EXIT_SHORT"
-        pattern_name = "Sign of Weakness"
-    elif "accumulation entering phase b" in text_lower:
-        signal_type = "EXIT_SHORT"
-        pattern_name = "Accumulation entering Phase B"
-    elif "markdown" in text_lower:
-        signal_type = "EXIT_SHORT"
-        pattern_name = "Markdown"
+    elif "sign of strength" in text_lower or "sos" in text_lower:
+        signal_type = "EXIT_LONG"
+        pattern_name = "Sign of Strength (SOS)"
 
     return symbol, signal_type, pattern_name
 
-# --- ФОНОВАЯ ПРОВЕРКА (ЖЕСТКИЙ СТОП 10% + ТЕЙК-ПРОФИТЫ RSI ПО 15М ПРИ ВОЗВРАТЕ) КАЖДЫЕ 15 МИНУТ ---
+# --- ФОНОВАЯ ПРОВЕРКА (ТЕЙК-ПРОФИТЫ RSI ПО 15М ПРИ ВОЗВРАТЕ) КАЖДЫЕ 15 МИНУТ ---
 def scheduled_rsi_check():
-    print("⏰ Запуск плановой проверки позиций (Жесткий стоп 10% + Тейк-профиты RSI 15m при возврате)...")
+    print("⏰ Запуск плановой проверки позиций (Тейк-профиты RSI 15m при возврате)...")
     positions = get_okx_all_positions()
     if not positions:
         return
@@ -304,7 +281,6 @@ def scheduled_rsi_check():
     for pos in positions:
         inst_id = pos["instId"]
         current_pos = pos["posSide"]
-        avg_px = pos["avgPx"]
         upl = pos.get("upl", 0.0)
         upl_ratio = pos.get("uplRatio", 0.0)
         pnl_sign = "+" if upl >= 0 else ""
@@ -312,43 +288,7 @@ def scheduled_rsi_check():
         short_coin = inst_id.replace("-USDT-SWAP", "USDT.P")
         icon = "✅" if upl >= 0 else "❌"
 
-        # 1. Проверка жесткого стоп-лосса в 10% движения цены против позиции
-        current_price = 0.0
-        try:
-            ticker_res = okx_request("GET", f"/api/v5/market/ticker?instId={inst_id}")
-            if ticker_res.get("code") == "0" and ticker_res.get("data"):
-                current_price = float(ticker_res["data"][0].get("last", 0.0))
-        except Exception as e:
-            print(f"Ошибка получения цены для стопа {inst_id}: {e}")
-
-        if avg_px > 0 and current_price > 0:
-            price_diff_pct = 0.0
-            if current_pos == "long":
-                price_diff_pct = ((current_price - avg_px) / avg_px) * 100
-                if price_diff_pct <= -10.0:
-                    close_res = close_okx_position(inst_id, "long")
-                    if close_res.get("code") == "0":
-                        send_telegram_msg(
-                            f"❌ *Жесткий стоп-лосс (10% цены)*\n"
-                            f"• Монета: `{short_coin}`\n"
-                            f"• Убыток по цене: `{price_diff_pct:.2f}%`\n"
-                            f"• PnL: `{pnl_str}`"
-                        )
-                        continue
-            elif current_pos == "short":
-                price_diff_pct = ((avg_px - current_price) / avg_px) * 100
-                if price_diff_pct <= -10.0:
-                    close_res = close_okx_position(inst_id, "short")
-                    if close_res.get("code") == "0":
-                        send_telegram_msg(
-                            f"❌ *Жесткий стоп-лосс (10% цены)*\n"
-                            f"• Монета: `{short_coin}`\n"
-                            f"• Рост против шорта: `{abs(price_diff_pct):.2f}%`\n"
-                            f"• PnL: `{pnl_str}`"
-                        )
-                        continue
-
-        # 2. Проверка Тейк-профитов по RSI (строго при условии, что позиция в плюсе upl >= 0)
+        # Проверка Тейк-профитов по RSI (строго при условии, что позиция в плюсе upl >= 0)
         if upl < 0:
             print(f"📊 {inst_id} ({current_pos.upper()}): позиция в просадке (PnL: {pnl_str}), RSI-тейк пропущен.")
             continue
@@ -520,20 +460,9 @@ def webhook():
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
     exit_icon = "✅" if upl >= 0 else "❌"
 
-    # Обработка парсинга выхода из лонга (Вайкоф)
+    # Обработка выхода из лонга (сигнал SOS)
     if signal_type == "EXIT_LONG" and current_pos == "long":
         close_res = close_okx_position(inst_id, "long")
-        if close_res.get("code") == "0":
-            send_telegram_msg(
-                f"{exit_icon} *Выход ({pattern_name})*\n"
-                f"• Монета: `{short_coin}`\n"
-                f"• PnL: `{pnl_str}`"
-            )
-        return "OK", 200
-
-    # Обработка парсинга выхода из шорта (Вайкоф)
-    if signal_type == "EXIT_SHORT" and current_pos == "short":
-        close_res = close_okx_position(inst_id, "short")
         if close_res.get("code") == "0":
             send_telegram_msg(
                 f"{exit_icon} *Выход ({pattern_name})*\n"
@@ -545,19 +474,10 @@ def webhook():
     if signal_type in ["EXIT_LONG", "EXIT_SHORT"]:
         return "OK", 200
 
-    # Автоматический вход по сигналу на DEFAULT_MARGIN (1 USDT) с разворотом
-    if signal_type in ["ENTRY_LONG", "ENTRY_SHORT"]:
-        side = "LONG" if signal_type == "ENTRY_LONG" else "SHORT"
-        circle_emoji = "🟢" if side == "LONG" else "🔴"
-
-        if side == "LONG" and current_pos == "short":
-            close_res = close_okx_position(inst_id, "short")
-            if close_res.get("code") == "0":
-                send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт SHORT по `{inst_id}`\n• PnL: `{pnl_str}`")
-        elif side == "SHORT" and current_pos == "long":
-            close_res = close_okx_position(inst_id, "long")
-            if close_res.get("code") == "0":
-                send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт LONG по `{inst_id}`\n• PnL: `{pnl_str}`")
+    # Автоматический вход в лонг по сигналу SC или Spring на DEFAULT_MARGIN (1 USDT)
+    if signal_type == "ENTRY_LONG":
+        side = "LONG"
+        circle_emoji = "🟢"
 
         success, err_msg = execute_okx_trade(symbol, side, DEFAULT_MARGIN)
         
