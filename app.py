@@ -229,7 +229,7 @@ def parse_alert(text):
     text_str = text if isinstance(text, str) else json.dumps(text)
     text_str = text_str.strip().replace('"', '').replace("'", "")
 
-    # Корректный поиск тикера в начале строки перед знаком '|' или ':'
+    # Надежное извлечение тикера в начале строки перед '|' или ':'
     match_start = re.match(r'^([A-Za-z0-9_\-\.]+)\s*(?:\||:)', text_str)
     if match_start:
         candidate = match_start.group(1).upper()
@@ -254,12 +254,18 @@ def parse_alert(text):
 
     text_lower = text_str.lower()
     
+    # 1. Сигналы на ВХОД
     if "spring" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "Spring"
     elif "selling climax" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "Selling Climax"
+    elif "upthrust" in text_lower or "utad" in text_lower:
+        signal_type = "ENTRY_SHORT"
+        pattern_name = "Upthrust / UTAD"
+
+    # 2. Сигналы на ВЫХОД (строго SOS для выхода из лонгов по твоему условию)
     elif "sign of strength" in text_lower or "sos" in text_lower:
         signal_type = "EXIT_LONG"
         pattern_name = "Sign of Strength (SOS)"
@@ -455,7 +461,7 @@ def webhook():
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
     exit_icon = "✅" if upl >= 0 else "❌"
 
-    # Обработка выхода из лонга (сигнал SOS)
+    # Обработка выхода из лонга (строго по сигналу SOS)
     if signal_type == "EXIT_LONG" and current_pos == "long":
         close_res = close_okx_position(inst_id, "long")
         if close_res.get("code") == "0":
@@ -466,13 +472,22 @@ def webhook():
             )
         return "OK", 200
 
-    if signal_type in ["EXIT_LONG", "EXIT_SHORT"]:
+    if signal_type == "EXIT_LONG":
         return "OK", 200
 
-    # Автоматический вход в лонг по сигналу SC или Spring на DEFAULT_MARGIN (1 USDT)
-    if signal_type == "ENTRY_LONG":
-        side = "LONG"
-        circle_emoji = "🟢"
+    # Автоматический вход в сделку (LONG или SHORT) с разворотом при необходимости
+    if signal_type in ["ENTRY_LONG", "ENTRY_SHORT"]:
+        side = "LONG" if signal_type == "ENTRY_LONG" else "SHORT"
+        circle_emoji = "🟢" if side == "LONG" else "🔴"
+
+        if side == "LONG" and current_pos == "short":
+            close_res = close_okx_position(inst_id, "short")
+            if close_res.get("code") == "0":
+                send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт SHORT по `{inst_id}`\n• PnL: `{pnl_str}`")
+        elif side == "SHORT" and current_pos == "long":
+            close_res = close_okx_position(inst_id, "long")
+            if close_res.get("code") == "0":
+                send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт LONG по `{inst_id}`\n• PnL: `{pnl_str}`")
 
         success, err_msg = execute_okx_trade(symbol, side, DEFAULT_MARGIN)
         
@@ -494,10 +509,7 @@ def webhook():
     return "OK", 200
 
 @app.route('/', methods=['POST', 'GET'])
-def index():
-    if request.method == 'GET':
-        return "OKX Smart Bot is Running!", 200
-    return webhook()
+index = lambda: ("OKX Smart Bot is Running!", 200) if request.method == 'GET' else webhook()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
