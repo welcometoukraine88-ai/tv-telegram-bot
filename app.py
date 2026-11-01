@@ -229,7 +229,6 @@ def parse_alert(text):
     text_str = text if isinstance(text, str) else json.dumps(text)
     text_str = text_str.strip().replace('"', '').replace("'", "")
 
-    # Надежное извлечение тикера в начале строки перед '|' или ':'
     match_start = re.match(r'^([A-Za-z0-9_\-\.]+)\s*(?:\||:)', text_str)
     if match_start:
         candidate = match_start.group(1).upper()
@@ -254,7 +253,6 @@ def parse_alert(text):
 
     text_lower = text_str.lower()
     
-    # 1. Сигналы на ВХОД
     if "spring" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "Spring"
@@ -264,15 +262,12 @@ def parse_alert(text):
     elif "upthrust" in text_lower or "utad" in text_lower:
         signal_type = "ENTRY_SHORT"
         pattern_name = "Upthrust / UTAD"
-
-    # 2. Сигналы на ВЫХОД (строго SOS для выхода из лонгов по твоему условию)
     elif "sign of strength" in text_lower or "sos" in text_lower:
         signal_type = "EXIT_LONG"
         pattern_name = "Sign of Strength (SOS)"
 
     return symbol, signal_type, pattern_name
 
-# --- ФОНОВАЯ ПРОВЕРКА (ТЕЙК-ПРОФИТЫ RSI ПО 15М ПРИ ВОЗВРАТЕ) КАЖДЫЕ 15 МИНУТ ---
 def scheduled_rsi_check():
     print("⏰ Запуск плановой проверки позиций (Тейк-профиты RSI 15m при возврате)...")
     positions = get_okx_all_positions()
@@ -289,7 +284,6 @@ def scheduled_rsi_check():
         short_coin = inst_id.replace("-USDT-SWAP", "USDT.P")
         icon = "✅" if upl >= 0 else "❌"
 
-        # Проверка Тейк-профитов по RSI (строго при условии, что позиция в плюсе upl >= 0)
         if upl < 0:
             print(f"📊 {inst_id} ({current_pos.upper()}): позиция в просадке (PnL: {pnl_str}), RSI-тейк пропущен.")
             continue
@@ -301,9 +295,6 @@ def scheduled_rsi_check():
         prev_rsi = rsi_history[-2]
         curr_rsi = rsi_history[-1]
 
-        print(f"📊 {inst_id} ({current_pos.upper()}): prev_RSI = {prev_rsi}, curr_RSI = {curr_rsi}")
-
-        # Условие выхода при ВОЗВРАТЕ из зоны экстремума на таймфрейме 15m
         if current_pos == "long" and prev_rsi >= RSI_EXIT_LONG and curr_rsi < RSI_EXIT_LONG:
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
@@ -325,7 +316,6 @@ def scheduled_rsi_check():
                 continue
 
 scheduler = BackgroundScheduler()
-# Запуск строго в 0, 15, 30 и 45 минут каждого часа на 5-й секунде
 scheduler.add_job(
     func=scheduled_rsi_check, 
     trigger=CronTrigger(minute="0,15,30,45", second="5")
@@ -439,7 +429,6 @@ def webhook():
         
         return "OK", 200
 
-    # 2. Обработка алертов от TradingView
     raw_data = request.get_data(as_text=True)
     print(f"📈 TRADINGVIEW ALERT: {raw_data}")
     
@@ -461,7 +450,6 @@ def webhook():
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
     exit_icon = "✅" if upl >= 0 else "❌"
 
-    # Обработка выхода из лонга (строго по сигналу SOS)
     if signal_type == "EXIT_LONG" and current_pos == "long":
         close_res = close_okx_position(inst_id, "long")
         if close_res.get("code") == "0":
@@ -475,7 +463,6 @@ def webhook():
     if signal_type == "EXIT_LONG":
         return "OK", 200
 
-    # Автоматический вход в сделку (LONG или SHORT) с разворотом при необходимости
     if signal_type in ["ENTRY_LONG", "ENTRY_SHORT"]:
         side = "LONG" if signal_type == "ENTRY_LONG" else "SHORT"
         circle_emoji = "🟢" if side == "LONG" else "🔴"
@@ -509,7 +496,10 @@ def webhook():
     return "OK", 200
 
 @app.route('/', methods=['POST', 'GET'])
-index = lambda: ("OKX Smart Bot is Running!", 200) if request.method == 'GET' else webhook()
+def index():
+    if request.method == 'GET':
+        return "OKX Smart Bot is Running!", 200
+    return webhook()
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
