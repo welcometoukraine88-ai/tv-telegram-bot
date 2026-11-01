@@ -227,20 +227,15 @@ def parse_alert(text):
     pattern_name = "SIGNAL"
 
     text_str = text if isinstance(text, str) else json.dumps(text)
+    text_str = text_str.strip().replace('"', '').replace("'", "")
 
-    if ":" in text_str:
-        parts = text_str.split(":", 1)
-        potential_prefix = parts[0].strip().replace('"', '').replace("'", "")
-        
-        clean_prefix_match = re.search(r'^([A-Za-z0-9_\-\.]+)(?:\s+\d+)?$', potential_prefix)
-        if clean_prefix_match:
-            candidate_sym = clean_prefix_match.group(1).upper()
-            if len(candidate_sym) > 2:
-                symbol = candidate_sym
-
-        text_str = parts[1]
-
-    if symbol == "UNKNOWN":
+    # Корректный поиск тикера в начале строки перед знаком '|' или ':'
+    match_start = re.match(r'^([A-Za-z0-9_\-\.]+)\s*(?:\||:)', text_str)
+    if match_start:
+        candidate = match_start.group(1).upper()
+        if len(candidate) > 1:
+            symbol = candidate
+    else:
         match = re.search(r'\b([A-Za-z0-9_]+(?:USDT|\.p|\.P|XAU))\b', text_str)
         if match:
             symbol = match.group(1).upper()
