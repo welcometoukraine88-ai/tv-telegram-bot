@@ -296,7 +296,7 @@ def scheduled_rsi_check():
 
         curr_rsi = rsi_history[-1]
 
-        # Упрощенное условие: если лонг и RSI > 70 ИЛИ если шорт и RSI < 30
+        # Упрощенное условие: если лонг и RSI > 70 ИЛИ если шорт и RSI < 30 (при условии прибыльности)
         if current_pos == "long" and curr_rsi > RSI_EXIT_LONG:
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
@@ -452,19 +452,10 @@ def webhook():
     upl_ratio = pos_info.get("uplRatio", 0.0) if pos_info else 0.0
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
-    exit_icon = "✅" if upl >= 0 else "❌"
 
-    if signal_type == "EXIT_LONG" and current_pos == "long":
-        close_res = close_okx_position(inst_id, "long")
-        if close_res.get("code") == "0":
-            send_telegram_msg(
-                f"{exit_icon} *Выход ({pattern_name})*\n"
-                f"• Монета: `{short_coin}`\n"
-                f"• PnL: `{pnl_str}`"
-            )
-        return "OK", 200
-
-    if signal_type == "EXIT_LONG":
+    # Сигналы выхода по вебхуку игнорируем (закрытие идет только по RSI в фоне)
+    if signal_type in ["EXIT_LONG", "EXIT_SHORT"]:
+        print(f"🔕 Сигнал выхода ({signal_type}) по вебхуку проигнорирован. Закрытие идет только по RSI.")
         return "OK", 200
 
     if signal_type in ["ENTRY_LONG", "ENTRY_SHORT"]:
