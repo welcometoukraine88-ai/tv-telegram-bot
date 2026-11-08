@@ -269,7 +269,7 @@ def parse_alert(text):
     return symbol, signal_type, pattern_name
 
 def scheduled_rsi_check():
-    print("⏰ Запуск плановой проверки позиций (Тейк-профиты RSI 15m при возврате)...")
+    print("⏰ Запуск плановой проверки позиций (Тейк-профиты по выходу RSI 15m за границы 30/70)...")
     positions = get_okx_all_positions()
     if not positions:
         return
@@ -284,33 +284,37 @@ def scheduled_rsi_check():
         short_coin = inst_id.replace("-USDT-SWAP", "USDT.P")
         icon = "✅" if upl >= 0 else "❌"
 
+        # Пропускаем, если позиция в минусе
         if upl < 0:
             print(f"📊 {inst_id} ({current_pos.upper()}): позиция в просадке (PnL: {pnl_str}), RSI-тейк пропущен.")
             continue
 
+        # Запрашиваем историю свечей для расчета RSI
         rsi_history = calculate_rsi_history(inst_id, RSI_TIMEFRAME, limit=30)
-        if len(rsi_history) < 2:
+        if not rsi_history:
             continue
 
-        prev_rsi = rsi_history[-2]
         curr_rsi = rsi_history[-1]
 
-        if current_pos == "long" and prev_rsi >= RSI_EXIT_LONG and curr_rsi < RSI_EXIT_LONG:
+        # Упрощенное условие: если лонг и RSI > 70 ИЛИ если шорт и RSI < 30
+        if current_pos == "long" and curr_rsi > RSI_EXIT_LONG:
             close_res = close_okx_position(inst_id, "long")
             if close_res.get("code") == "0":
                 send_telegram_msg(
-                    f"{icon} *Тейк-профит (RSI Возврат)*\n"
+                    f"{icon} *Тейк-профит (RSI Выход > 70)*\n"
                     f"• Монета: `{short_coin}`\n"
+                    f"• RSI: `{curr_rsi}`\n"
                     f"• PnL: `{pnl_str}`"
                 )
                 continue
 
-        elif current_pos == "short" and prev_rsi <= RSI_EXIT_SHORT and curr_rsi > RSI_EXIT_SHORT:
+        elif current_pos == "short" and curr_rsi < RSI_EXIT_SHORT:
             close_res = close_okx_position(inst_id, "short")
             if close_res.get("code") == "0":
                 send_telegram_msg(
-                    f"{icon} *Тейк-профит (RSI Возврат)*\n"
+                    f"{icon} *Тейк-профит (RSI Выход < 30)*\n"
                     f"• Монета: `{short_coin}`\n"
+                    f"• RSI: `{curr_rsi}`\n"
                     f"• PnL: `{pnl_str}`"
                 )
                 continue
