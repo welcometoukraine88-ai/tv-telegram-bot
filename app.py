@@ -8,8 +8,6 @@ import hmac
 import hashlib
 from flask import Flask, request
 import requests
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
 
 app = Flask(__name__)
 
@@ -21,10 +19,6 @@ OKX_SECRET_KEY = os.environ.get("OKX_SECRET_KEY", "")
 OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "")
 
 OKX_BASE_URL = "https://www.okx.com"
-
-RSI_TIMEFRAME = "15m"
-RSI_EXIT_LONG = 70.0
-RSI_EXIT_SHORT = 30.0
 
 # Автоматическая маржа по умолчанию 1.0 USDT (можно переопределить через env DEFAULT_MARGIN)
 DEFAULT_MARGIN = float(os.environ.get("DEFAULT_MARGIN", "1.0"))
@@ -58,7 +52,7 @@ def okx_request(method, request_path, body_data=None):
             res = requests.post(url, data=body_str, headers=headers, timeout=10)
         return res.json()
     except Exception as e:
-        print(f"Ошибка запроса к OKX ({request_path}): {e}")
+        print(f"❌ Ошибка запроса к OKX ({request_path}): {e}")
         return {"code": "-1", "msg": str(e)}
 
 def send_telegram_msg(text, reply_markup=None):
@@ -76,7 +70,7 @@ def send_telegram_msg(text, reply_markup=None):
         if data.get("ok"):
             return data["result"]["message_id"]
     except Exception as e:
-        print(f"Ошибка отправки в Telegram: {e}")
+        print(f"❌ Ошибка отправки в Telegram: {e}")
     return None
 
 def set_okx_leverage(inst_id, leverage):
@@ -111,52 +105,9 @@ def close_okx_position(inst_id, pos_side):
         "mgnMode": "cross",
         "posSide": pos_side
     }
-    return okx_request("POST", "/api/v5/trade/close-position", body)
-
-def calculate_rsi_history(inst_id, timeframe=RSI_TIMEFRAME, limit=30):
-    res = okx_request("GET", f"/api/v5/market/candles?instType=SWAP&instId={inst_id}&bar={timeframe}&limit={limit}")
-    if res.get("code") != "0" or not res.get("data"):
-        return []
-
-    raw_candles = res["data"]
-    if len(raw_candles) < 20:
-        return []
-
-    candles = list(reversed(raw_candles))
-    closes = [float(c[4]) for c in candles]
-
-    rsi_list = []
-    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    gains = [max(c, 0.0) for c in changes]
-    losses = [abs(min(c, 0.0)) for c in changes]
-
-    length = 14
-    if len(gains) < length:
-        return []
-
-    avg_gain = sum(gains[:length]) / length
-    avg_loss = sum(losses[:length]) / length
-
-    if avg_loss == 0:
-        rsi_list.append(100.0)
-    elif avg_gain == 0:
-        rsi_list.append(0.0)
-    else:
-        rs = avg_gain / avg_loss
-        rsi_list.append(round(100.0 - (100.0 / (1.0 + rs)), 2))
-
-    for i in range(length, len(gains)):
-        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
-        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
-        if avg_loss == 0:
-            rsi_list.append(100.0)
-        elif avg_gain == 0:
-            rsi_list.append(0.0)
-        else:
-            rs = avg_gain / avg_loss
-            rsi_list.append(round(100.0 - (100.0 / (1.0 + rs)), 2))
-
-    return rsi_list
+    res = okx_request("POST", "/api/v5/trade/close-position", body)
+    print(f"🔄 Ответ закрытия позиции {inst_id} ({pos_side}): {res}")
+    return res
 
 def execute_okx_trade(symbol, side_type, margin_usdt):
     clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("USDT", "")
@@ -181,7 +132,7 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         if ticker_res.get("code") == "0" and ticker_res.get("data"):
             last_price = float(ticker_res["data"][0].get("last", 0.0))
     except Exception as e:
-        print(f"Ошибка данных {inst_id}: {e}")
+        print(f"❌ Ошибка данных {inst_id}: {e}")
 
     if last_price <= 0:
         return False, f"Не удалось получить цену для `{inst_id}`."
@@ -262,69 +213,14 @@ def parse_alert(text):
     elif "upthrust" in text_lower or "utad" in text_lower:
         signal_type = "ENTRY_SHORT"
         pattern_name = "Upthrust / UTAD"
-    elif "sign of strength" in text_lower or "sos" in text_lower:
+    elif "exit_long" in text_lower or "rsi returned below 70" in text_lower:
         signal_type = "EXIT_LONG"
-        pattern_name = "Sign of Strength (SOS)"
+        pattern_name = "RSI Exit Long (>70)"
+    elif "exit_short" in text_lower or "rsi returned above 30" in text_lower:
+        signal_type = "EXIT_SHORT"
+        pattern_name = "RSI Exit Short (<30)"
 
     return symbol, signal_type, pattern_name
-
-def scheduled_rsi_check():
-    print("⏰ Запуск плановой проверки позиций (Тейк-профиты по выходу RSI 15m за границы 30/70)...")
-    positions = get_okx_all_positions()
-    if not positions:
-        return
-
-    for pos in positions:
-        inst_id = pos["instId"]
-        current_pos = pos["posSide"]
-        upl = pos.get("upl", 0.0)
-        upl_ratio = pos.get("uplRatio", 0.0)
-        pnl_sign = "+" if upl >= 0 else ""
-        pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
-        short_coin = inst_id.replace("-USDT-SWAP", "USDT.P")
-        icon = "✅" if upl >= 0 else "❌"
-
-        # Пропускаем, если позиция в минусе
-        if upl < 0:
-            print(f"📊 {inst_id} ({current_pos.upper()}): позиция в просадке (PnL: {pnl_str}), RSI-тейк пропущен.")
-            continue
-
-        # Запрашиваем историю свечей для расчета RSI
-        rsi_history = calculate_rsi_history(inst_id, RSI_TIMEFRAME, limit=30)
-        if not rsi_history:
-            continue
-
-        curr_rsi = rsi_history[-1]
-
-        # Упрощенное условие: если лонг и RSI > 70 ИЛИ если шорт и RSI < 30 (при условии прибыльности)
-        if current_pos == "long" and curr_rsi > RSI_EXIT_LONG:
-            close_res = close_okx_position(inst_id, "long")
-            if close_res.get("code") == "0":
-                send_telegram_msg(
-                    f"{icon} *Тейк-профит (RSI Выход > 70)*\n"
-                    f"• Монета: `{short_coin}`\n"
-                    f"• RSI: `{curr_rsi}`\n"
-                    f"• PnL: `{pnl_str}`"
-                )
-                continue
-
-        elif current_pos == "short" and curr_rsi < RSI_EXIT_SHORT:
-            close_res = close_okx_position(inst_id, "short")
-            if close_res.get("code") == "0":
-                send_telegram_msg(
-                    f"{icon} *Тейк-профит (RSI Выход < 30)*\n"
-                    f"• Монета: `{short_coin}`\n"
-                    f"• RSI: `{curr_rsi}`\n"
-                    f"• PnL: `{pnl_str}`"
-                )
-                continue
-
-scheduler = BackgroundScheduler()
-scheduler.add_job(
-    func=scheduled_rsi_check, 
-    trigger=CronTrigger(minute="0,15,30,45", second="5")
-)
-scheduler.start()
 
 @app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
@@ -453,11 +349,37 @@ def webhook():
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-    # Сигналы выхода по вебхуку игнорируем (закрытие идет только по RSI в фоне)
+    # --- ОБРАБОТКА СИГНАЛОВ ВЫХОДА (С ПРОВЕРКОЙ ПРИБЫЛИ UPL > 0) ---
     if signal_type in ["EXIT_LONG", "EXIT_SHORT"]:
-        print(f"🔕 Сигнал выхода ({signal_type}) по вебхуку проигнорирован. Закрытие идет только по RSI.")
+        target_pos_side = "long" if signal_type == "EXIT_LONG" else "short"
+        
+        # Проверяем, открыта ли вообще такая позиция
+        if not pos_info or current_pos != target_pos_side:
+            print(f"🔕 Сигнал {signal_type} для {inst_id} проигнорирован: активная позиция {target_pos_side} не найдена.")
+            return "OK", 200
+
+        # СТРОГОЕ УСЛОВИЕ: закрываем по RSI только если позиция в плюсе (PnL > 0)
+        if upl <= 0:
+            print(f"📊 {inst_id} ({target_pos_side.upper()}): сигнал выхода по RSI получен, но позиция в просадке/нуле (PnL: {pnl_str}). Выход пропущен.")
+            return "OK", 200
+
+        print(f"🔔 [RSI WEBHOOK] Закрытие прибыльного {target_pos_side.upper()} для {inst_id} | PnL: {pnl_str}")
+        close_res = close_okx_position(inst_id, target_pos_side)
+        
+        if close_res.get("code") == "0":
+            icon = "✅"
+            send_telegram_msg(
+                f"{icon} *Тейк-профит (RSI Выход)*\n"
+                f"• Монета: `{short_coin}`\n"
+                f"• Стратегия: `{pattern_name}`\n"
+                f"• PnL: `{pnl_str}`"
+            )
+        else:
+            print(f"❌ Ошибка закрытия позиции {inst_id}: {close_res}")
+
         return "OK", 200
 
+    # --- ОБРАБОТКА СИГНАЛОВ ВХОДА ---
     if signal_type in ["ENTRY_LONG", "ENTRY_SHORT"]:
         side = "LONG" if signal_type == "ENTRY_LONG" else "SHORT"
         circle_emoji = "🟢" if side == "LONG" else "🔴"
