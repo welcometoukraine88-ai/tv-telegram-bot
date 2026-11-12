@@ -485,7 +485,7 @@ def webhook():
     return "OK", 200
 
 @app.route('/', methods=['POST', 'GET'])
-1def index():
+def index():
     if request.method == 'GET':
         return "OKX Smart Bot is Running!", 200
     return webhook()
