@@ -81,6 +81,16 @@ def set_okx_leverage(inst_id, leverage):
     }
     return okx_request("POST", "/api/v5/account/set-leverage", body)
 
+def get_okx_account_balance():
+    """Получает общий баланс аккаунта (Total Equity в USDT)"""
+    res = okx_request("GET", "/api/v5/account/balance")
+    if res.get("code") == "0" and res.get("data"):
+        details = res["data"][0].get("details", [])
+        for det in details:
+            if det.get("ccy") == "USDT":
+                return float(det.get("eq", 0.0))
+    return 0.0
+
 def get_okx_all_positions():
     res = okx_request("GET", "/api/v5/account/positions?instType=SWAP")
     positions = []
@@ -109,7 +119,30 @@ def close_okx_position(inst_id, pos_side):
     print(f"🔄 Ответ закрытия позиции {inst_id} ({pos_side}): {res}")
     return res
 
+def check_drawdown_limit():
+    """Проверяет общую просадку: если суммарный убыток > 40% от депозита, возвращает False"""
+    try:
+        total_equity = get_okx_account_balance()
+        if total_equity <= 0:
+            return True # Если баланс не удалось получить, не блокируем торговлю по ошибке API
+
+        positions = get_okx_all_positions()
+        total_upl = sum(p["upl"] for p in positions)
+
+        # Если общий PnL отрицательный и его модуль превышает 40% от эквити аккаунта
+        if total_upl < 0 and abs(total_upl) >= (total_equity * 0.40):
+            print(f"🛑 ЗАЩИТА СРАБОТАЛА: Общий убыток ${total_upl:.2f} превышает 40% депозита (${total_equity:.2f})!")
+            return False
+    except Exception as e:
+        print(f"⚠️ Ошибка проверки просадки: {e}")
+    
+    return True
+
 def execute_okx_trade(symbol, side_type, margin_usdt):
+    # Дополнительная проверка просадки перед открытием сделки
+    if not check_drawdown_limit():
+        return False, "Защита депозита: суммарная просадка превышает 40%!"
+
     clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
     okx_side = "sell" if side_type == "SHORT" else "buy"
@@ -172,7 +205,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
         # Если это шорт, выставляем усреднение (+5%) и стоп-лосс (+10%)
         if side_type == "SHORT":
             try:
-                # Округляем цены под шаг инструмента (tickSz)
                 def round_to_tick(val):
                     return round(round(val / tick_sz) * tick_sz, 6)
 
@@ -182,7 +214,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
                 avg_px_str = f"{round_to_tick(avg_price):f}"
                 stop_px_str = f"{round_to_tick(stop_price):f}"
 
-                # 1. Лимитный ордер на усреднение (SELL на 5% выше)
                 dca_body = {
                     "instId": inst_id,
                     "tdMode": "cross",
@@ -194,7 +225,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
                 }
                 okx_request("POST", "/api/v5/trade/order", dca_body)
 
-                # 2. Стоп-маркет ордер на закрытие 100% позиции (BUY на 10% выше)
                 stop_body = {
                     "instId": inst_id,
                     "tdMode": "cross",
@@ -397,12 +427,10 @@ def webhook():
     if signal_type in ["EXIT_LONG", "EXIT_SHORT"]:
         target_pos_side = "long" if signal_type == "EXIT_LONG" else "short"
         
-        # Проверяем, открыта ли вообще такая позиция
         if not pos_info or current_pos != target_pos_side:
             print(f"🔕 Сигнал {signal_type} для {inst_id} проигнорирован: активная позиция {target_pos_side} не найдена.")
             return "OK", 200
 
-        # СТРОГОЕ УСЛОВИЕ: закрываем по RSI только если позиция в плюсе (PnL > 0)
         if upl <= 0:
             print(f"📊 {inst_id} ({target_pos_side.upper()}): сигнал выхода по RSI получен, но позиция в просадке/нуле (PnL: {pnl_str}). Выход пропущен.")
             return "OK", 200
@@ -452,12 +480,12 @@ def webhook():
                 f"• Паттерн: `{pattern_name}`"
             )
         else:
-            send_telegram_msg(f"⚠️ *Ошибка открытия `{short_coin}`*\n• Причина: `{err_msg}`")
+            send_telegram_msg(f"⚠️ *Защита депозита / Ошибка открытия `{short_coin}`*\n• Причина: `{err_msg}`")
 
     return "OK", 200
 
 @app.route('/', methods=['POST', 'GET'])
-def index():
+1def index():
     if request.method == 'GET':
         return "OKX Smart Bot is Running!", 200
     return webhook()
