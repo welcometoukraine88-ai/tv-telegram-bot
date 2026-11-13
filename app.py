@@ -120,18 +120,18 @@ def close_okx_position(inst_id, pos_side):
     return res
 
 def check_drawdown_limit():
-    """Проверяет общую просадку: если суммарный убыток > 40% от депозита, возвращает False"""
+    """Проверяет общую просадку: если суммарный убыток > 50% от депозита, возвращает False"""
     try:
         total_equity = get_okx_account_balance()
         if total_equity <= 0:
-            return True # Если баланс не удалось получить, не блокируем торговлю по ошибке API
+            return True 
 
         positions = get_okx_all_positions()
         total_upl = sum(p["upl"] for p in positions)
 
-        # Если общий PnL отрицательный и его модуль превышает 40% от эквити аккаунта
-        if total_upl < 0 and abs(total_upl) >= (total_equity * 0.40):
-            print(f"🛑 ЗАЩИТА СРАБОТАЛА: Общий убыток ${total_upl:.2f} превышает 40% депозита (${total_equity:.2f})!")
+        # Изменили 0.40 на 0.50
+        if total_upl < 0 and abs(total_upl) >= (total_equity * 0.50):
+            print(f"🛑 ЗАЩИТА СРАБОТАЛА: Общий убыток ${total_upl:.2f} превышает 50% депозита (${total_equity:.2f})!")
             return False
     except Exception as e:
         print(f"⚠️ Ошибка проверки просадки: {e}")
