@@ -277,12 +277,12 @@ def parse_alert(text):
     elif "upthrust" in text_lower or "utad" in text_lower:
         signal_type = "ENTRY_SHORT"
         pattern_name = "Upthrust / UTAD"
-    # Выходы: Buying Climax -> EXIT_LONG, Selling Climax -> EXIT_SHORT
+    # Выходы / Стопы: Climax-паттерны
     elif "buying climax" in text_lower:
-        signal_type = "EXIT_LONG"
+        signal_type = "BUYING_CLIMAX"
         pattern_name = "Buying Climax"
     elif "selling climax" in text_lower:
-        signal_type = "EXIT_SHORT"
+        signal_type = "SELLING_CLIMAX"
         pattern_name = "Selling Climax"
 
     return symbol, signal_type, pattern_name
@@ -309,21 +309,24 @@ def webhook():
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-    # --- ОБРАБОТКА СИГНАЛОВ ВЫХОДА (БЕЗ ПРОВЕРКИ PNL) ---
-    if signal_type in ["EXIT_LONG", "EXIT_SHORT"]:
-        target_pos_side = "long" if signal_type == "EXIT_LONG" else "short"
-        
-        if not pos_info or current_pos != target_pos_side:
-            print(f"🔕 Сигнал {signal_type} ({pattern_name}) для {inst_id} проигнорирован: активная позиция {target_pos_side} не найдена.")
+    # --- ОБРАБОТКА CLIMAX-СИГНАЛОВ (ВЫХОД ИЛИ СТОП-ЛОСС) ---
+    if signal_type in ["BUYING_CLIMAX", "SELLING_CLIMAX"]:
+        if not pos_info or not current_pos:
+            print(f"🔕 Сигнал {pattern_name} для {inst_id} проигнорирован: активных позиций нет.")
             return "OK", 200
 
-        print(f"🔔 [WYCKOFF WEBHOOK] Закрытие {target_pos_side.upper()} для {inst_id} | PnL: {pnl_str}")
-        close_res = close_okx_position(inst_id, target_pos_side)
+        is_stop_loss = (signal_type == "BUYING_CLIMAX" and current_pos == "short") or \
+                       (signal_type == "SELLING_CLIMAX" and current_pos == "long")
+
+        close_reason = "Стоп-лосс (Wyckoff SL)" if is_stop_loss else "Закрытие позиции (Wyckoff Выход)"
+        icon = "🛑" if is_stop_loss else ("✅" if upl >= 0 else "⚠️")
+
+        print(f"🔔 [WYCKOFF WEBHOOK] {close_reason} | {current_pos.upper()} для {inst_id} | PnL: {pnl_str}")
+        close_res = close_okx_position(inst_id, current_pos)
         
         if close_res.get("code") == "0":
-            icon = "✅" if upl >= 0 else "🛑"
             send_telegram_msg(
-                f"{icon} *Закрытие позиции (Wyckoff Выход)*\n"
+                f"{icon} *{close_reason}*\n"
                 f"• Монета: `{short_coin}`\n"
                 f"• Паттерн: `{pattern_name}`\n"
                 f"• PnL: `{pnl_str}`"
