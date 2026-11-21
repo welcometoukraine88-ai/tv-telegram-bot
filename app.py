@@ -182,57 +182,32 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
 
     formatted_sz = str(int(contracts_qty)) if lot_sz.is_integer() else f"{contracts_qty:.4f}".rstrip('0').rstrip('.')
 
+    # Лимитная цена: на 0.1% ниже для LONG, на 0.1% выше для SHORT
+    if side_type == "SHORT":
+        limit_price = last_price * 1.001
+    else:
+        limit_price = last_price * 0.999
+
+    if tick_sz > 0:
+        precision = max(0, -int(math.floor(math.log10(tick_sz))))
+        limit_price = round(round(limit_price / tick_sz) * tick_sz, precision)
+        formatted_px = f"{limit_price:.{precision}f}" if precision > 0 else str(int(limit_price))
+    else:
+        formatted_px = f"{limit_price:.6f}".rstrip('0').rstrip('.')
+
     order_body = {
         "instId": inst_id,
         "tdMode": "cross",
         "side": okx_side,
         "posSide": pos_side,
-        "ordType": "market",
+        "ordType": "limit",
+        "px": formatted_px,
         "sz": formatted_sz
     }
 
     res = okx_request("POST", "/api/v5/trade/order", order_body)
 
     if res.get("code") == "0":
-        # Если это шорт, выставляем усреднение (+5%) и стоп-лосс (+10%)
-        if side_type == "SHORT":
-            try:
-                def round_to_tick(val):
-                    return round(round(val / tick_sz) * tick_sz, 6)
-
-                avg_price = last_price * 1.05   # Усреднение на 5% выше цены входа
-                stop_price = last_price * 1.10  # Стоп-лосс на 10% выше цены входа
-
-                avg_px_str = f"{round_to_tick(avg_price):f}"
-                stop_px_str = f"{round_to_tick(stop_price):f}"
-
-                dca_body = {
-                    "instId": inst_id,
-                    "tdMode": "cross",
-                    "side": "sell",
-                    "posSide": "short",
-                    "ordType": "limit",
-                    "px": avg_px_str,
-                    "sz": formatted_sz
-                }
-                okx_request("POST", "/api/v5/trade/order", dca_body)
-
-                stop_body = {
-                    "instId": inst_id,
-                    "tdMode": "cross",
-                    "side": "buy",
-                    "posSide": "short",
-                    "ordType": "stop_market",
-                    "sz": formatted_sz,
-                    "tpTriggerPx": stop_px_str,
-                    "tpOrdPx": "-1",
-                    "slTriggerPx": stop_px_str,
-                    "slOrdPx": "-1"
-                }
-                okx_request("POST", "/api/v5/trade/order-algo", stop_body)
-            except Exception as e:
-                print(f"⚠️ Ошибка выставления DCA/SL ордеров для {inst_id}: {e}")
-
         return True, "Success"
     else:
         msg = res.get("data", [{}])[0].get("sMsg") or res.get("msg")
