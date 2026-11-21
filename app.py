@@ -23,9 +23,6 @@ OKX_BASE_URL = "https://www.okx.com"
 # Автоматическая маржа по умолчанию 1.0 USDT (можно переопределить через env DEFAULT_MARGIN)
 DEFAULT_MARGIN = float(os.environ.get("DEFAULT_MARGIN", "1.0"))
 
-# Словарь для ожидания ввода маржи: {chat_id: {"symbol": ..., "side": ..., "inst_id": ..., "message_id": ...}}
-PENDING_MARGIN_INPUT = {}
-
 def get_okx_signature(timestamp, method, request_path, body=""):
     message = timestamp + method + request_path + body
     mac = hmac.new(OKX_SECRET_KEY.encode('utf-8'), message.encode('utf-8'), hashlib.sha256)
@@ -55,16 +52,13 @@ def okx_request(method, request_path, body_data=None):
         print(f"❌ Ошибка запроса к OKX ({request_path}): {e}")
         return {"code": "-1", "msg": str(e)}
 
-def send_telegram_msg(text, reply_markup=None):
+def send_telegram_msg(text):
     try:
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": text,
             "parse_mode": "Markdown"
         }
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-            
         res = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload, timeout=5)
         data = res.json()
         if data.get("ok"):
@@ -129,7 +123,6 @@ def check_drawdown_limit():
         positions = get_okx_all_positions()
         total_upl = sum(p["upl"] for p in positions)
 
-        # Изменили 0.40 на 0.50
         if total_upl < 0 and abs(total_upl) >= (total_equity * 0.50):
             print(f"🛑 ЗАЩИТА СРАБОТАЛА: Общий убыток ${total_upl:.2f} превышает 50% депозита (${total_equity:.2f})!")
             return False
@@ -139,9 +132,8 @@ def check_drawdown_limit():
     return True
 
 def execute_okx_trade(symbol, side_type, margin_usdt):
-    # Дополнительная проверка просадки перед открытием сделки
     if not check_drawdown_limit():
-        return False, "Защита депозита: суммарная просадка превышает 40%!"
+        return False, "Защита депозита: суммарная просадка превышает 50%!"
 
     clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("USDT", "")
     inst_id = f"{clean_symbol}-USDT-SWAP"
@@ -278,131 +270,25 @@ def parse_alert(text):
 
     text_lower = text_str.lower()
     
+    # Входы: Spring -> LONG, Upthrust / UTAD -> SHORT
     if "spring" in text_lower:
         signal_type = "ENTRY_LONG"
         pattern_name = "Spring"
-    elif "selling climax" in text_lower:
-        signal_type = "ENTRY_LONG"
-        pattern_name = "Selling Climax"
     elif "upthrust" in text_lower or "utad" in text_lower:
         signal_type = "ENTRY_SHORT"
         pattern_name = "Upthrust / UTAD"
-    elif "exit_long" in text_lower or "rsi returned below 70" in text_lower:
+    # Выходы: Buying Climax -> EXIT_LONG, Selling Climax -> EXIT_SHORT
+    elif "buying climax" in text_lower:
         signal_type = "EXIT_LONG"
-        pattern_name = "RSI Exit Long (>70)"
-    elif "exit_short" in text_lower or "rsi returned above 30" in text_lower:
+        pattern_name = "Buying Climax"
+    elif "selling climax" in text_lower:
         signal_type = "EXIT_SHORT"
-        pattern_name = "RSI Exit Short (<30)"
+        pattern_name = "Selling Climax"
 
     return symbol, signal_type, pattern_name
 
 @app.route('/webhook', methods=['POST', 'GET'])
 def webhook():
-    global PENDING_MARGIN_INPUT
-    
-    data = request.get_json(silent=True)
-    
-    if data:
-        print(f"📥 TELEGRAM JSON DATA: {json.dumps(data, ensure_ascii=False)}")
-        
-        if "callback_query" in data:
-            query = data["callback_query"]
-            query_id = query.get("id")
-            callback_data = query.get("data", "")
-            message = query.get("message", {})
-            chat_id = message.get("chat", {}).get("id")
-            message_id = message.get("message_id")
-            
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": query_id})
-            
-            if callback_data.startswith("skip_"):
-                if chat_id and message_id:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", json={
-                        "chat_id": chat_id,
-                        "message_id": message_id,
-                        "text": message.get("text", "") + "\n\n_🚫 Сигнал пропущен_",
-                        "parse_mode": "Markdown"
-                    })
-                return "OK", 200
-                
-            if callback_data.startswith("enter_"):
-                parts = callback_data.split("_")
-                side = parts[1]
-                symbol = parts[2]
-                clean_symbol = symbol.replace(".P", "").replace(".p", "").replace("USDT", "")
-                inst_id = f"{clean_symbol}-USDT-SWAP"
-
-                PENDING_MARGIN_INPUT[chat_id] = {
-                    "symbol": symbol,
-                    "side": side,
-                    "inst_id": inst_id,
-                    "message_id": message_id
-                }
-
-                if chat_id and message_id:
-                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText", json={
-                        "chat_id": chat_id,
-                        "message_id": message_id,
-                        "text": message.get("text", "") + f"\n\n💬 *Введите размер маржи (USDT) в чат для `{inst_id}`:*",
-                        "parse_mode": "Markdown"
-                    })
-                return "OK", 200
-
-        if "message" in data and "text" in data["message"]:
-            msg = data["message"]
-            chat_id = msg["chat"]["id"]
-            user_text = msg["text"].strip()
-
-            if chat_id in PENDING_MARGIN_INPUT:
-                try:
-                    margin_usdt = float(user_text.replace(",", "."))
-                    if margin_usdt > 0:
-                        sig = PENDING_MARGIN_INPUT.pop(chat_id)
-                        symbol = sig["symbol"]
-                        side = sig["side"]
-                        inst_id = sig["inst_id"]
-
-                        positions = get_okx_all_positions()
-                        pos_info = next((p for p in positions if p["instId"] == inst_id), None)
-                        current_pos = pos_info["posSide"] if pos_info else None
-                        upl = pos_info.get("upl", 0.0) if pos_info else 0.0
-                        upl_ratio = pos_info.get("uplRatio", 0.0) if pos_info else 0.0
-                        pnl_sign = "+" if upl >= 0 else ""
-                        pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
-                        short_coin = symbol
-
-                        if side == "LONG" and current_pos == "short":
-                            close_res = close_okx_position(inst_id, "short")
-                            if close_res.get("code") == "0":
-                                send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт SHORT по `{inst_id}`\n• PnL: `{pnl_str}`")
-                        elif side == "SHORT" and current_pos == "long":
-                            close_res = close_okx_position(inst_id, "long")
-                            if close_res.get("code") == "0":
-                                send_telegram_msg(f"🔄 *Разворот позиции*\n• Закрыт LONG по `{inst_id}`\n• PnL: `{pnl_str}`")
-
-                        success, err_msg = execute_okx_trade(symbol, side, margin_usdt)
-                        emoji = "🚀" if side == "LONG" else "🔻"
-                        
-                        if success:
-                            time.sleep(0.5)
-                            new_positions = get_okx_all_positions()
-                            new_pos = next((p for p in new_positions if p["instId"] == inst_id), None)
-                            active_lev = new_pos.get("lever", "20") if new_pos else "20"
-                            send_telegram_msg(
-                                f"{emoji} *Вход: {side}*\n"
-                                f"• Монета: `{short_coin}`\n"
-                                f"• Маржа: `${margin_usdt} USDT`\n"
-                                f"• Плечо: `{active_lev}x`\n"
-                                f"• Паттерн: `Manual`"
-                            )
-                        else:
-                            send_telegram_msg(f"⚠️ *Ошибка открытия `{short_coin}`*\n• Причина: `{err_msg}`")
-                        return "OK", 200
-                except ValueError:
-                    send_telegram_msg("⚠️ Пожалуйста, введите число для маржи (например: `10`)")
-        
-        return "OK", 200
-
     raw_data = request.get_data(as_text=True)
     print(f"📈 TRADINGVIEW ALERT: {raw_data}")
     
@@ -423,27 +309,23 @@ def webhook():
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
 
-    # --- ОБРАБОТКА СИГНАЛОВ ВЫХОДА (С ПРОВЕРКОЙ ПРИБЫЛИ UPL > 0) ---
+    # --- ОБРАБОТКА СИГНАЛОВ ВЫХОДА (БЕЗ ПРОВЕРКИ PNL) ---
     if signal_type in ["EXIT_LONG", "EXIT_SHORT"]:
         target_pos_side = "long" if signal_type == "EXIT_LONG" else "short"
         
         if not pos_info or current_pos != target_pos_side:
-            print(f"🔕 Сигнал {signal_type} для {inst_id} проигнорирован: активная позиция {target_pos_side} не найдена.")
+            print(f"🔕 Сигнал {signal_type} ({pattern_name}) для {inst_id} проигнорирован: активная позиция {target_pos_side} не найдена.")
             return "OK", 200
 
-        if upl <= 0:
-            print(f"📊 {inst_id} ({target_pos_side.upper()}): сигнал выхода по RSI получен, но позиция в просадке/нуле (PnL: {pnl_str}). Выход пропущен.")
-            return "OK", 200
-
-        print(f"🔔 [RSI WEBHOOK] Закрытие прибыльного {target_pos_side.upper()} для {inst_id} | PnL: {pnl_str}")
+        print(f"🔔 [WYCKOFF WEBHOOK] Закрытие {target_pos_side.upper()} для {inst_id} | PnL: {pnl_str}")
         close_res = close_okx_position(inst_id, target_pos_side)
         
         if close_res.get("code") == "0":
-            icon = "✅"
+            icon = "✅" if upl >= 0 else "🛑"
             send_telegram_msg(
-                f"{icon} *Тейк-профит (RSI Выход)*\n"
+                f"{icon} *Закрытие позиции (Wyckoff Выход)*\n"
                 f"• Монета: `{short_coin}`\n"
-                f"• Стратегия: `{pattern_name}`\n"
+                f"• Паттерн: `{pattern_name}`\n"
                 f"• PnL: `{pnl_str}`"
             )
         else:
