@@ -277,6 +277,13 @@ def parse_alert(text):
     elif "upthrust" in text_lower or "utad" in text_lower:
         signal_type = "ENTRY_SHORT"
         pattern_name = "Upthrust / UTAD"
+    # Тейк-профиты: Sign of strength -> TP LONG, Sign of weakness -> TP SHORT
+    elif "sign of strength" in text_lower or re.search(r'\bsos\b', text_lower):
+        signal_type = "TP_LONG"
+        pattern_name = "Sign of Strength"
+    elif "sign of weakness" in text_lower or re.search(r'\bsow\b', text_lower):
+        signal_type = "TP_SHORT"
+        pattern_name = "Sign of Weakness"
     # Выходы / Стопы: Climax-паттерны
     elif "buying climax" in text_lower:
         signal_type = "BUYING_CLIMAX"
@@ -308,6 +315,30 @@ def webhook():
     upl_ratio = pos_info.get("uplRatio", 0.0) if pos_info else 0.0
     pnl_sign = "+" if upl >= 0 else ""
     pnl_str = f"{pnl_sign}${upl:,.2f} ({pnl_sign}{upl_ratio:.2f}%)"
+
+    # --- ОБРАБОТКА ТЕЙК-ПРОФИТОВ (SIGN OF STRENGTH / SIGN OF WEAKNESS) ---
+    if signal_type in ["TP_LONG", "TP_SHORT"]:
+        target_pos_side = "long" if signal_type == "TP_LONG" else "short"
+
+        if not pos_info or current_pos != target_pos_side:
+            print(f"🔕 Сигнал TP ({pattern_name}) для {inst_id} проигнорирован: активная позиция {target_pos_side} не найдена.")
+            return "OK", 200
+
+        print(f"🎯 [WYCKOFF WEBHOOK] Тейк-профит | {target_pos_side.upper()} для {inst_id} | PnL: {pnl_str}")
+        close_res = close_okx_position(inst_id, target_pos_side)
+
+        if close_res.get("code") == "0":
+            icon = "✅" if upl >= 0 else "⚠️"
+            send_telegram_msg(
+                f"{icon} *Тейк-профит (Wyckoff TP)*\n"
+                f"• Монета: `{short_coin}`\n"
+                f"• Паттерн: `{pattern_name}`\n"
+                f"• PnL: `{pnl_str}`"
+            )
+        else:
+            print(f"❌ Ошибка закрытия позиции {inst_id}: {close_res}")
+
+        return "OK", 200
 
     # --- ОБРАБОТКА CLIMAX-СИГНАЛОВ (ВЫХОД ИЛИ СТОП-ЛОСС) ---
     if signal_type in ["BUYING_CLIMAX", "SELLING_CLIMAX"]:
