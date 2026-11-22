@@ -144,7 +144,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
     last_price = 0.0
     ct_val = 1.0
     lot_sz = 1.0
-    tick_sz = 0.1
 
     try:
         inst_res = okx_request("GET", f"/api/v5/public/instruments?instType=SWAP&instId={inst_id}")
@@ -153,7 +152,6 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
             max_lev = int(inst_data.get("lever", 20))
             ct_val = float(inst_data.get("ctVal", 1.0))
             lot_sz = float(inst_data.get("lotSz", 1.0))
-            tick_sz = float(inst_data.get("tickSz", 0.1))
 
         ticker_res = okx_request("GET", f"/api/v5/market/ticker?instId={inst_id}")
         if ticker_res.get("code") == "0" and ticker_res.get("data"):
@@ -182,26 +180,12 @@ def execute_okx_trade(symbol, side_type, margin_usdt):
 
     formatted_sz = str(int(contracts_qty)) if lot_sz.is_integer() else f"{contracts_qty:.4f}".rstrip('0').rstrip('.')
 
-    # Лимитная цена: на 0.1% ниже для LONG, на 0.1% выше для SHORT
-    if side_type == "SHORT":
-        limit_price = last_price * 1.001
-    else:
-        limit_price = last_price * 0.999
-
-    if tick_sz > 0:
-        precision = max(0, -int(math.floor(math.log10(tick_sz))))
-        limit_price = round(round(limit_price / tick_sz) * tick_sz, precision)
-        formatted_px = f"{limit_price:.{precision}f}" if precision > 0 else str(int(limit_price))
-    else:
-        formatted_px = f"{limit_price:.6f}".rstrip('0').rstrip('.')
-
     order_body = {
         "instId": inst_id,
         "tdMode": "cross",
         "side": okx_side,
         "posSide": pos_side,
-        "ordType": "limit",
-        "px": formatted_px,
+        "ordType": "market",
         "sz": formatted_sz
     }
 
