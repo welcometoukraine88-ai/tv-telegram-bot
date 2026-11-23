@@ -3,7 +3,6 @@ import base64
 import hashlib
 import hmac
 import json
-import math
 import os
 import re
 import threading
@@ -26,7 +25,6 @@ SESSION_STRING = os.environ.get("TG_SESSION_STRING", "")
 
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TARGET_CHAT_ID = int(os.environ.get("TG_CHAT_ID", "0"))
-RAW_SOURCE = os.environ.get("SOURCE_CHANNEL", "").strip().lstrip("@")
 
 # OKX API Env
 OKX_API_KEY = os.environ.get("OKX_API_KEY", "").strip()
@@ -35,15 +33,80 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE", "").strip()
 OKX_BASE_URL = "https://www.okx.com"
 
 
-def resolve_source_channel():
-  if not RAW_SOURCE:
+# ==========================================
+# ПАРСЕРЫ ПО КАНАЛАМ
+# ==========================================
+
+
+def parse_nesterov(text: str):
+  if not text:
     return None
-  if re.fullmatch(r"-?\d+", RAW_SOURCE):
-    return int(RAW_SOURCE)
-  return RAW_SOURCE
+
+  header_match = re.search(
+      r"\b([A-Z0-9_]+USDT)\s*\|\s*(LONG|SHORT)\b",
+      text,
+      re.IGNORECASE,
+  )
+  if not header_match:
+    return None
+
+  symbol = header_match.group(1).upper()
+  side = header_match.group(2).upper()
+
+  tbx_match = re.search(r"ТВХ\s*:\s*([0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE)
+  if not tbx_match:
+    return None
+  entry_price = float(tbx_match.group(1).replace(",", "."))
+
+  tp_section_match = re.search(
+      r"Тейк-профит\s*:\s*(.*?)(?=\n\s*Стоп\s*:|\Z)",
+      text,
+      re.IGNORECASE | re.DOTALL,
+  )
+  tps = []
+  if tp_section_match:
+    tp_lines = tp_section_match.group(1)
+    for m in re.finditer(
+        r"([0-9]+(?:[.,][0-9]+)?)\s*\(\s*([0-9]+(?:[.,][0-9]+)?)\s*%\s*\)",
+        tp_lines,
+    ):
+      price = float(m.group(1).replace(",", "."))
+      share = float(m.group(2).replace(",", "."))
+      tps.append({"price": price, "share_pct": share})
+
+  sl_match = re.search(r"Стоп\s*:\s*([0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE)
+  stop_price = float(sl_match.group(1).replace(",", ".")) if sl_match else None
+
+  if not tps or stop_price is None:
+    return None
+
+  return {
+      "symbol": symbol,
+      "side": side,
+      "entry_price": entry_price,
+      "tps": tps,
+      "stop_price": stop_price,
+  }
 
 
-SOURCE_CHANNEL = resolve_source_channel()
+# ==========================================
+# РЕЕСТР КАНАЛОВ И ИХ ПРАВИЛ ТОРГОВЛИ
+# ==========================================
+
+CHANNEL_CONFIGS = {
+    -1003845170751: {
+        "name": "Нестеров",
+        "parser": parse_nesterov,
+        "order_type": "limit",  # "limit" или "market"
+        "default_sl_pct": None,  # если None — берём стоп строго из сигнала
+    },
+}
+
+
+# ==========================================
+# СЕРВИСНЫЕ ФУНКЦИИ И OKX API
+# ==========================================
+
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
 
 pending_signals = {}
@@ -53,7 +116,7 @@ web_app = Flask(__name__)
 
 @web_app.route("/")
 def health():
-  return "Telegram OKX Signal Executor is running", 200
+  return "Telegram OKX Multi-Channel Executor is running", 200
 
 
 def send_bot_msg(chat_id: int, text: str):
@@ -161,8 +224,23 @@ def get_instrument_spec(inst_id: str) -> dict:
   }
 
 
+def get_market_price(inst_id: str) -> float:
+  rows = okx_request(
+      "GET",
+      "/api/v5/market/ticker",
+      params={"instId": inst_id},
+  )
+  if not rows:
+    raise RuntimeError(f"Не удалось получить текущую цену для {inst_id}")
+  return float(rows[0]["last"])
+
+
 def get_max_cross_leverage(inst_id: str, pos_mode: str, side: str) -> str:
-  pos_side = ("long" if side == "LONG" else "short") if pos_mode == "long_short_mode" else None
+  pos_side = (
+      ("long" if side == "LONG" else "short")
+      if pos_mode == "long_short_mode"
+      else None
+  )
   rows = okx_request(
       "GET",
       "/api/v5/account/leverage-info",
@@ -198,6 +276,7 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
   inst_id = symbol_to_inst_id(sig["symbol"])
   side = sig["side"]
   is_long = side == "LONG"
+  order_type = sig.get("order_type", "limit")
 
   pos_mode = get_account_pos_mode()
   is_hedge = pos_mode == "long_short_mode"
@@ -209,9 +288,14 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
 
   lever_dec = Decimal(str(max_lev))
   margin_dec = Decimal(str(margin_usdt))
-  entry_px_dec = round_step(sig["entry_price"], spec["tickSz"], ROUND_HALF_UP)
+
+  if order_type == "market" or sig.get("entry_price") is None:
+    ref_price = get_market_price(inst_id)
+    entry_px_dec = round_step(ref_price, spec["tickSz"], ROUND_HALF_UP)
+  else:
+    entry_px_dec = round_step(sig["entry_price"], spec["tickSz"], ROUND_HALF_UP)
+
   ct_val_dec = Decimal(str(spec["ctVal"]))
-  lot_sz_dec = Decimal(str(spec["lotSz"]))
   min_sz_dec = Decimal(str(spec["minSz"]))
 
   if entry_px_dec <= 0 or ct_val_dec <= 0:
@@ -230,161 +314,153 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
   entry_side = "buy" if is_long else "sell"
   close_side = "sell" if is_long else "buy"
 
-  # 1. Входной лимитный ордер по ТВХ
+  # 1. Входной ордер (limit или market)
   entry_payload = {
       "instId": inst_id,
       "tdMode": "cross",
       "side": entry_side,
-      "ordType": "limit",
-      "px": fmt_dec(entry_px_dec),
+      "ordType": order_type,
       "sz": fmt_dec(total_sz),
   }
+  if order_type == "limit":
+    entry_payload["px"] = fmt_dec(entry_px_dec)
   if is_hedge:
     entry_payload["posSide"] = pos_side
 
   entry_res = okx_request("POST", "/api/v5/trade/order", data=entry_payload)
   entry_ord_id = entry_res[0].get("ordId") if entry_res else "?"
 
-  # 2. Лесенка тейков (TP) сразу при открытии
+  # 2. Лесенка тейков (TP), если заданы в сигнале
   tp_results = []
-  allocated_sz = Decimal("0")
-  tps = sig["tps"]
-  total_share = sum(Decimal(str(t["share_pct"])) for t in tps)
+  tps = sig.get("tps") or []
+  if tps:
+    allocated_sz = Decimal("0")
+    total_share = sum(Decimal(str(t["share_pct"])) for t in tps)
 
-  for idx, tp in enumerate(tps):
-    tp_px_dec = round_step(tp["price"], spec["tickSz"], ROUND_HALF_UP)
-    if idx < len(tps) - 1:
-      if total_share > 0:
-        share_ratio = Decimal(str(tp["share_pct"])) / total_share
+    for idx, tp in enumerate(tps):
+      tp_px_dec = round_step(tp["price"], spec["tickSz"], ROUND_HALF_UP)
+      if idx < len(tps) - 1:
+        if total_share > 0:
+          share_ratio = Decimal(str(tp["share_pct"])) / total_share
+        else:
+          share_ratio = Decimal(str(tp["share_pct"])) / Decimal("100")
+        tp_sz = round_step(
+            float(total_sz * share_ratio), spec["lotSz"], ROUND_DOWN
+        )
+        if tp_sz > total_sz - allocated_sz:
+          tp_sz = round_step(
+              float(total_sz - allocated_sz), spec["lotSz"], ROUND_DOWN
+          )
+        allocated_sz += tp_sz
       else:
-        share_ratio = Decimal(str(tp["share_pct"])) / Decimal("100")
-      tp_sz = round_step(float(total_sz * share_ratio), spec["lotSz"], ROUND_DOWN)
-      if tp_sz > total_sz - allocated_sz:
-        tp_sz = round_step(float(total_sz - allocated_sz), spec["lotSz"], ROUND_DOWN)
-      allocated_sz += tp_sz
-    else:
-      tp_sz = round_step(float(total_sz - allocated_sz), spec["lotSz"], ROUND_DOWN)
+        tp_sz = round_step(
+            float(total_sz - allocated_sz), spec["lotSz"], ROUND_DOWN
+        )
 
-    if tp_sz <= 0:
-      continue
+      if tp_sz <= 0:
+        continue
 
-    tp_payload = {
+      tp_payload = {
+          "instId": inst_id,
+          "tdMode": "cross",
+          "side": close_side,
+          "ordType": "conditional",
+          "sz": fmt_dec(tp_sz),
+          "tpTriggerPx": fmt_dec(tp_px_dec),
+          "tpOrdPx": "-1",
+      }
+      if is_hedge:
+        tp_payload["posSide"] = pos_side
+      else:
+        tp_payload["reduceOnly"] = True
+
+      tp_res = okx_request("POST", "/api/v5/trade/order-algo", data=tp_payload)
+      algo_id = tp_res[0].get("algoId") if tp_res else "?"
+      tp_results.append({
+          "tp": idx + 1,
+          "px": fmt_dec(tp_px_dec),
+          "sz": fmt_dec(tp_sz),
+          "algoId": algo_id,
+      })
+
+  # 3. Стоп-лосс (SL): из сигнала или расчётный от default_sl_pct
+  raw_stop = sig.get("stop_price")
+  if raw_stop is None and sig.get("default_sl_pct"):
+    sl_mult = (
+        (1.0 - float(sig["default_sl_pct"]) / 100.0)
+        if is_long
+        else (1.0 + float(sig["default_sl_pct"]) / 100.0)
+    )
+    raw_stop = float(entry_px_dec) * sl_mult
+
+  sl_px_str = "—"
+  sl_algo_id = "—"
+  if raw_stop is not None:
+    sl_px_dec = round_step(raw_stop, spec["tickSz"], ROUND_HALF_UP)
+    sl_payload = {
         "instId": inst_id,
         "tdMode": "cross",
         "side": close_side,
         "ordType": "conditional",
-        "sz": fmt_dec(tp_sz),
-        "tpTriggerPx": fmt_dec(tp_px_dec),
-        "tpOrdPx": "-1",
+        "sz": fmt_dec(total_sz),
+        "slTriggerPx": fmt_dec(sl_px_dec),
+        "slOrdPx": "-1",
     }
     if is_hedge:
-      tp_payload["posSide"] = pos_side
+      sl_payload["posSide"] = pos_side
     else:
-      tp_payload["reduceOnly"] = True
+      sl_payload["reduceOnly"] = True
 
-    tp_res = okx_request("POST", "/api/v5/trade/order-algo", data=tp_payload)
-    algo_id = tp_res[0].get("algoId") if tp_res else "?"
-    tp_results.append({
-        "tp": idx + 1,
-        "px": fmt_dec(tp_px_dec),
-        "sz": fmt_dec(tp_sz),
-        "algoId": algo_id,
-    })
-
-  # 3. Стоп-лосс (SL) сразу при открытии на весь объём входа
-  sl_px_dec = round_step(sig["stop_price"], spec["tickSz"], ROUND_HALF_UP)
-  sl_payload = {
-      "instId": inst_id,
-      "tdMode": "cross",
-      "side": close_side,
-      "ordType": "conditional",
-      "sz": fmt_dec(total_sz),
-      "slTriggerPx": fmt_dec(sl_px_dec),
-      "slOrdPx": "-1",
-  }
-  if is_hedge:
-    sl_payload["posSide"] = pos_side
-  else:
-    sl_payload["reduceOnly"] = True
-
-  sl_res = okx_request("POST", "/api/v5/trade/order-algo", data=sl_payload)
-  sl_algo_id = sl_res[0].get("algoId") if sl_res else "?"
+    sl_res = okx_request("POST", "/api/v5/trade/order-algo", data=sl_payload)
+    sl_algo_id = sl_res[0].get("algoId") if sl_res else "?"
+    sl_px_str = fmt_dec(sl_px_dec)
 
   return {
       "inst_id": inst_id,
+      "order_type": order_type,
       "max_lev": max_lev,
-      "entry_px": fmt_dec(entry_px_dec),
+      "entry_px": "MARKET" if order_type == "market" else fmt_dec(entry_px_dec),
       "total_sz": fmt_dec(total_sz),
       "entry_ord_id": entry_ord_id,
       "tps": tp_results,
-      "sl_px": fmt_dec(sl_px_dec),
+      "sl_px": sl_px_str,
       "sl_algo_id": sl_algo_id,
   }
 
 
-def parse_signal_post(text: str):
-  if not text:
-    return None
-
-  header_match = re.search(
-      r"\b([A-Z0-9_]+USDT)\s*\|\s*(LONG|SHORT)\b",
-      text,
-      re.IGNORECASE,
-  )
-  if not header_match:
-    return None
-
-  symbol = header_match.group(1).upper()
-  side = header_match.group(2).upper()
-
-  tbx_match = re.search(r"ТВХ\s*:\s*([0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE)
-  if not tbx_match:
-    return None
-  entry_price = float(tbx_match.group(1).replace(",", "."))
-
-  tp_section_match = re.search(
-      r"Тейк-профит\s*:\s*(.*?)(?=\n\s*Стоп\s*:|\Z)",
-      text,
-      re.IGNORECASE | re.DOTALL,
-  )
-  tps = []
-  if tp_section_match:
-    tp_lines = tp_section_match.group(1)
-    for m in re.finditer(
-        r"([0-9]+(?:[.,][0-9]+)?)\s*\(\s*([0-9]+(?:[.,][0-9]+)?)\s*%\s*\)",
-        tp_lines,
-    ):
-      price = float(m.group(1).replace(",", "."))
-      share = float(m.group(2).replace(",", "."))
-      tps.append({"price": price, "share_pct": share})
-
-  sl_match = re.search(r"Стоп\s*:\s*([0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE)
-  stop_price = float(sl_match.group(1).replace(",", ".")) if sl_match else None
-
-  if not tps or stop_price is None:
-    return None
-
-  return {
-      "symbol": symbol,
-      "side": side,
-      "entry_price": entry_price,
-      "tps": tps,
-      "stop_price": stop_price,
-  }
-
-
 def format_signal_card(sig: dict) -> str:
-  tp_lines = "\n".join(
-      f"  • TP{i+1}: `{tp['price']}` ({tp['share_pct']}%)"
-      for i, tp in enumerate(sig["tps"])
+  source_name = sig.get("source_name", "Неизвестный канал")
+  order_type = sig.get("order_type", "limit")
+  entry_label = (
+      "По рынку (MARKET)"
+      if order_type == "market"
+      else f"`{sig['entry_price']}` (лимит)"
   )
+
+  tps = sig.get("tps") or []
+  if tps:
+    tp_block = "• Тейки лесенкой:\n" + "\n".join(
+        f"  • TP{i+1}: `{tp['price']}` ({tp['share_pct']}%)"
+        for i, tp in enumerate(tps)
+    )
+  else:
+    tp_block = "• Тейки: не заданы"
+
+  if sig.get("stop_price") is not None:
+    sl_label = f"`{sig['stop_price']}`"
+  elif sig.get("default_sl_pct"):
+    sl_label = f"авто `{sig['default_sl_pct']}%` от входа"
+  else:
+    sl_label = "не задан"
+
   emoji = "🟢" if sig["side"] == "LONG" else "🔴"
   return (
       f"{emoji} *Новый сигнал: `{sig['symbol']}` — {sig['side']}*\n"
+      f"• Источник: *{source_name}*\n"
       f"• Режим: `CROSS` | Плечо: `MAX` (авто)\n"
-      f"• ТВХ (лимит): `{sig['entry_price']}`\n"
-      f"• Тейки лесенкой:\n{tp_lines}\n"
-      f"• Стоп-лосс: `{sig['stop_price']}`\n\n"
+      f"• Вход: {entry_label}\n"
+      f"{tp_block}\n"
+      f"• Стоп-лосс: {sl_label}\n\n"
       "✍️ Введите сумму маржи в *USDT* (например, `15`) или напишите `skip` для"
       " отмены:"
   )
@@ -417,7 +493,9 @@ def poll_bot_replies():
           if text.lower() in ("skip", "отмена", "пропустить"):
             skipped = pending_signals.pop(user_id)
             send_bot_msg(
-                chat_id, f"⏭ Сигнал по `{skipped['symbol']}` пропущен."
+                chat_id,
+                f"⏭ Сигнал по `{skipped['symbol']}`"
+                f" ({skipped.get('source_name', '')}) пропущен.",
             )
             continue
 
@@ -435,22 +513,29 @@ def poll_bot_replies():
 
           sig = pending_signals.pop(user_id)
           print(
-              f"⚡ Отправляем на OKX: {sig} | Маржа: {margin} USDT", flush=True
+              f"⚡ Отправляем на OKX [{sig.get('source_name')}]: {sig} | Маржа:"
+              f" {margin} USDT",
+              flush=True,
           )
           try:
             res = execute_okx_signal(sig, margin)
-            tp_summary = "\n".join(
-                f"  • TP{t['tp']}: `{t['px']}` | `{t['sz']}` контр."
-                f" (`{t['algoId']}`)"
-                for t in res["tps"]
+            tp_summary = (
+                "\n".join(
+                    f"  • TP{t['tp']}: `{t['px']}` | `{t['sz']}` контр."
+                    f" (`{t['algoId']}`)"
+                    for t in res["tps"]
+                )
+                if res["tps"]
+                else "  • без TP"
             )
             send_bot_msg(
                 chat_id,
                 f"✅ *Ордера выставлены на OKX (`{res['inst_id']}`)*\n"
+                f"• Источник: *{sig.get('source_name')}*\n"
                 f"• Сторона: `{sig['side']}` (`CROSS`, плечо `{res['max_lev']}x`)\n"
-                f"• Лимит ТВХ: `{res['entry_px']}` | Объём: `{res['total_sz']}`"
-                f" контр. (`{res['entry_ord_id']}`)\n"
-                f"• TP лесенкой:\n{tp_summary}\n"
+                f"• Вход ({res['order_type'].upper()}): `{res['entry_px']}` |"
+                f" Объём: `{res['total_sz']}` контр. (`{res['entry_ord_id']}`)\n"
+                f"• TP:\n{tp_summary}\n"
                 f"• SL: `{res['sl_px']}` | `{res['total_sz']}` контр."
                 f" (`{res['sl_algo_id']}`)",
             )
@@ -471,14 +556,23 @@ def run_web():
   web_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
-@client.on(events.NewMessage(chats=SOURCE_CHANNEL))
+@client.on(events.NewMessage(chats=list(CHANNEL_CONFIGS.keys())))
 async def on_channel_post(event):
+  cfg = CHANNEL_CONFIGS.get(event.chat_id)
+  if not cfg:
+    return
+
   raw_text = event.raw_text or ""
-  sig = parse_signal_post(raw_text)
+  sig = cfg["parser"](raw_text)
   if not sig:
     return
 
-  print(f"📩 Спарсен сигнал: {sig}", flush=True)
+  sig["source_id"] = event.chat_id
+  sig["source_name"] = cfg["name"]
+  sig["order_type"] = cfg.get("order_type", "limit")
+  sig["default_sl_pct"] = cfg.get("default_sl_pct")
+
+  print(f"📩 Спарсен сигнал [{cfg['name']}]: {sig}", flush=True)
   pending_signals[TARGET_CHAT_ID] = sig
   send_bot_msg(TARGET_CHAT_ID, format_signal_card(sig))
 
@@ -490,8 +584,11 @@ async def start_services():
     return
 
   me = await client.get_me()
+  channels_str = ", ".join(
+      f"{cfg['name']} ({cid})" for cid, cfg in CHANNEL_CONFIGS.items()
+  )
   print(f"✅ Авторизованы как: {me.first_name} (ID: {me.id})", flush=True)
-  print(f"🚀 Слушатель канала запущен (цель: {SOURCE_CHANNEL})...", flush=True)
+  print(f"🚀 Слушатель запущен. Каналы: {channels_str}", flush=True)
   await client.run_until_disconnected()
 
 
@@ -502,14 +599,13 @@ if __name__ == "__main__":
       SESSION_STRING,
       BOT_TOKEN,
       TARGET_CHAT_ID,
-      SOURCE_CHANNEL,
       OKX_API_KEY,
       OKX_SECRET_KEY,
       OKX_PASSPHRASE,
   ]
-  if not all(required):
+  if not all(required) or not CHANNEL_CONFIGS:
     raise SystemExit(
-        "❌ Заполните все переменные окружения (Telegram + OKX) на Render!"
+        "❌ Заполните переменные окружения (Telegram + OKX) и CHANNEL_CONFIGS!"
     )
 
   threading.Thread(target=run_web, daemon=True).start()
