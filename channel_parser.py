@@ -57,6 +57,7 @@ NON_TICKER_WORDS = {
     "SL",
     "STOP",
     "СТОП",
+    "СТОПЛОСС",
     "ЦЕЛЬ",
     "ЦЕЛИ",
     "ТЕЙК",
@@ -64,6 +65,7 @@ NON_TICKER_WORDS = {
     "ВХОД",
     "ТВХ",
     "РЫНОК",
+    "РЫНКОМ",
     "MARKET",
     "LIMIT",
     "ЛИМИТ",
@@ -74,6 +76,11 @@ NON_TICKER_WORDS = {
     "ПЛЕЧО",
     "РИСК",
     "БАНК",
+    "ДЕПОЗИТ",
+    "СДЕЛКА",
+    "ВАЖНО",
+    "НОВОСТИ",
+    "СИГНАЛ",
     "USDT",
     "USDC",
     "USD",
@@ -108,6 +115,8 @@ def normalize_symbol(raw_symbol: str) -> str:
   )
   if not cleaned or cleaned in NON_TICKER_WORDS:
     return ""
+  if not re.fullmatch(r"[A-Z][A-Z0-9]{1,11}", cleaned):
+    return ""
   return f"{cleaned}USDT"
 
 
@@ -124,7 +133,7 @@ def detect_side(text: str) -> str:
     if tok in ("SHORT", "ШОРТ", "SELL"):
       return "SHORT"
 
-  if re.search(r"🟢|📈|🚀|лонг\w*|покуп\w*", text, re.IGNORECASE):
+  if re.search(r"🟢|📈|лонг\w*|покуп\w*", text, re.IGNORECASE):
     return "LONG"
   if re.search(r"🔴|📉|🔻|шорт\w*|продаж\w*", text, re.IGNORECASE):
     return "SHORT"
@@ -132,9 +141,10 @@ def detect_side(text: str) -> str:
 
 
 def detect_symbol(text: str) -> str:
+  # 1. Явная пара: BTC/USDT, #ETH-USDT, SOL_USDT, BTCUSDT
   pair_patterns = [
-      r"[#\$]?\b([A-Za-z0-9]{2,15})\s*[/\-_]\s*(?:USDT|USDC|USD|PERP|SWAP)\b",
-      r"[#\$]?\b([A-Za-z0-9]{2,15})(?:USDT|USDC)\b",
+      r"[#\$]?\b([A-Za-z][A-Za-z0-9]{1,11})\s*[/\-_]\s*(?:USDT|USDC|USD|PERP|SWAP)\b",
+      r"[#\$]?\b([A-Za-z][A-Za-z0-9]{1,11})(?:USDT|USDC)\b",
   ]
   for pat in pair_patterns:
     for m in re.finditer(pat, text, re.IGNORECASE):
@@ -142,13 +152,15 @@ def detect_symbol(text: str) -> str:
       if sym:
         return sym
 
-  for m in re.finditer(r"[#\$]([A-Za-z0-9]{2,15})\b", text):
+  # 2. Тикер с # или $
+  for m in re.finditer(r"[#\$]([A-Za-z][A-Za-z0-9]{1,11})\b", text):
     sym = normalize_symbol(m.group(1))
     if sym:
       return sym
 
+  # 3. Тикер рядом со словом LONG / SHORT / ЛОНГ / ШОРТ
   for m in re.finditer(
-      r"\b([A-Za-z0-9]{2,15})\b\s*[\|\-–—:]?\s*\b(?:LONG|SHORT|ЛОНГ|ШОРТ)\b",
+      r"\b([A-Za-z][A-Za-z0-9]{1,11})\b\s*[\|\-–—:]?\s*\b(?:LONG|SHORT|ЛОНГ|ШОРТ)\b",
       text,
       re.IGNORECASE,
   ):
@@ -157,20 +169,11 @@ def detect_symbol(text: str) -> str:
       return sym
 
   for m in re.finditer(
-      r"\b(?:LONG|SHORT|ЛОНГ|ШОРТ)\b\s*[\|\-–—:]?\s*\b([A-Za-z0-9]{2,15})\b",
+      r"\b(?:LONG|SHORT|ЛОНГ|ШОРТ)\b\s*[\|\-–—:]?\s*\b([A-Za-z][A-Za-z0-9]{1,11})\b",
       text,
       re.IGNORECASE,
   ):
     sym = normalize_symbol(m.group(1))
-    if sym:
-      return sym
-
-  head = "\n".join(text.splitlines()[:4])
-  for m in re.finditer(r"\b([A-Z0-9]{2,12})\b", head):
-    cand = m.group(1).upper()
-    if cand.isdigit():
-      continue
-    sym = normalize_symbol(cand)
     if sym:
       return sym
 
@@ -186,7 +189,7 @@ def extract_entry(text: str):
     if m:
       line = m.group(1).strip()
       if re.search(
-          r"по\s+рынку|рынок|с\s+рынка|market|mkt|по\s+тек\w*|current",
+          r"по\s+рынку|рынок|рынком|с\s+рынка|market|mkt|по\s+тек\w*|current",
           line,
           re.IGNORECASE,
       ):
@@ -428,7 +431,10 @@ def send_bot_msg(chat_id: int, text: str):
         json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
         timeout=10,
     )
-    return r.json()
+    resp_json = r.json()
+    if not resp_json.get("ok"):
+      print(f"❌ Telegram Bot API вернул ошибку: {resp_json}", flush=True)
+    return resp_json
   except Exception as e:
     print(f"❌ Ошибка отправки в бот: {e}", flush=True)
     return None
@@ -717,7 +723,6 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
   entry_side = "buy" if is_long else "sell"
   close_side = "sell" if is_long else "buy"
 
-  # 1. Входной ордер (limit или market)
   entry_payload = {
       "instId": inst_id,
       "tdMode": "cross",
@@ -746,7 +751,6 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
     except Exception:
       pass
 
-  # 2. Тейк-профит (один или лесенка), если заданы в сигнале
   tp_results = []
   tps = sig.get("tps") or []
   if tps:
@@ -799,7 +803,6 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
           "algoId": algo_id,
       })
 
-  # 3. Стоп-лосс (SL): из сигнала или расчётный от default_sl_pct (по умолчанию 10%)
   raw_stop = sig.get("stop_price")
   if raw_stop is None:
     sl_pct = float(sig.get("default_sl_pct") or DEFAULT_STOP_LOSS_PCT)
@@ -1049,14 +1052,13 @@ def poll_bot_replies():
             continue
 
           chat_id = msg["chat"]["id"]
-          user_id = msg["from"]["id"]
           text = (msg.get("text") or "").strip()
 
-          if chat_id != TARGET_CHAT_ID or user_id not in pending_signals:
+          if chat_id != TARGET_CHAT_ID or chat_id not in pending_signals:
             continue
 
           if text.lower() in ("skip", "отмена", "пропустить"):
-            skipped = pending_signals.pop(user_id)
+            skipped = pending_signals.pop(chat_id)
             send_bot_msg(
                 chat_id,
                 f"⏭ Сигнал по `{skipped['symbol']}`"
@@ -1076,7 +1078,7 @@ def poll_bot_replies():
             )
             continue
 
-          sig = pending_signals.pop(user_id)
+          sig = pending_signals.pop(chat_id)
           print(
               f"⚡ Отправляем на OKX [{sig.get('source_name')}]: {sig} | Маржа:"
               f" {margin} USDT",
@@ -1121,8 +1123,7 @@ def run_web():
   web_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
-@client.on(events.NewMessage(chats=list(CHANNEL_CONFIGS.keys())))
-async def on_channel_post(event):
+async def process_channel_message(event, event_kind: str):
   cfg = CHANNEL_CONFIGS.get(event.chat_id)
   if not cfg:
     return
@@ -1138,10 +1139,20 @@ async def on_channel_post(event):
     if raw_text.strip():
       preview = raw_text.strip().replace("\n", " | ")[:220]
       print(
-          f"ℹ️ Пост в [{cfg['name']}] не распознан как сигнал: {preview}",
+          f"ℹ️ [{event_kind}] Пост в [{cfg['name']}] не распознан: {preview}",
           flush=True,
       )
     return
+
+  # Не перезаписываем активный сигнал в ожидании, если пришёл дубль при редактировании
+  if TARGET_CHAT_ID in pending_signals:
+    prev = pending_signals[TARGET_CHAT_ID]
+    if (
+        prev.get("symbol") == sig.get("symbol")
+        and prev.get("side") == sig.get("side")
+        and prev.get("source_id") == event.chat_id
+    ):
+      return
 
   sig["source_id"] = event.chat_id
   sig["source_name"] = cfg["name"]
@@ -1150,9 +1161,19 @@ async def on_channel_post(event):
   )
   sig["default_sl_pct"] = cfg.get("default_sl_pct", DEFAULT_STOP_LOSS_PCT)
 
-  print(f"📩 Спарсен сигнал [{cfg['name']}]: {sig}", flush=True)
+  print(f"📩 [{event_kind}] Спарсен сигнал [{cfg['name']}]: {sig}", flush=True)
   pending_signals[TARGET_CHAT_ID] = sig
   send_bot_msg(TARGET_CHAT_ID, format_signal_card(sig))
+
+
+@client.on(events.NewMessage(chats=list(CHANNEL_CONFIGS.keys())))
+async def on_channel_post(event):
+  await process_channel_message(event, "NewMessage")
+
+
+@client.on(events.MessageEdited(chats=list(CHANNEL_CONFIGS.keys())))
+async def on_channel_edit(event):
+  await process_channel_message(event, "MessageEdited")
 
 
 async def start_services():
