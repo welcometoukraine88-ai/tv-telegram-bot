@@ -334,6 +334,51 @@ def parse_roman_zlatov(text: str):
   }
 
 
+def parse_goat_trading(text: str):
+  if not text:
+    return None
+
+  header_match = re.search(
+      r"#?\s*([A-Za-z0-9_]+(?:\s*/\s*USDT|USDT)?)\s+(LONG|SHORT|ЛОНГ|ШОРТ)\b",
+      text,
+      re.IGNORECASE,
+  )
+  if not header_match:
+    return None
+
+  symbol = normalize_symbol(header_match.group(1))
+  raw_side = header_match.group(2).upper()
+  side = "LONG" if raw_side in ("LONG", "ЛОНГ") else "SHORT"
+  if not symbol:
+    return None
+
+  tp_match = re.search(
+      r"Цель\s*:\s*([0-9]+(?:[.,][0-9]+)?)",
+      text,
+      re.IGNORECASE,
+  )
+  if not tp_match:
+    return None
+  tp_price = float(tp_match.group(1).replace(",", "."))
+
+  sl_match = re.search(
+      r"Стоп(?:-лосс)?\s*:\s*([0-9]+(?:[.,][0-9]+)?)",
+      text,
+      re.IGNORECASE,
+  )
+  stop_price = float(sl_match.group(1).replace(",", ".")) if sl_match else None
+  if stop_price is None:
+    return None
+
+  return {
+      "symbol": symbol,
+      "side": side,
+      "entry_price": None,
+      "tps": [{"price": tp_price, "share_pct": 100.0}],
+      "stop_price": stop_price,
+  }
+
+
 def to_telethon_channel_id(raw_id: int) -> int:
   if raw_id < 0:
     return raw_id
@@ -375,6 +420,12 @@ CHANNEL_CONFIGS = {
     to_telethon_channel_id(1698940666): {
         "name": "Роман Златов",
         "parser": parse_roman_zlatov,
+        "order_type": "market",
+        "default_sl_pct": None,
+    },
+    to_telethon_channel_id(2224581920): {
+        "name": "GOAT TRADING",
+        "parser": parse_goat_trading,
         "order_type": "market",
         "default_sl_pct": None,
     },
