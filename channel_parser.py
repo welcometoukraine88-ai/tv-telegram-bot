@@ -13,7 +13,7 @@ SESSION_STRING = os.environ.get("TG_SESSION_STRING", "")
 
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TARGET_CHAT_ID = int(os.environ.get("TG_CHAT_ID", "0"))
-SOURCE_CHANNEL = os.environ.get("SOURCE_CHANNEL", "").strip().lstrip("@")
+RAW_SOURCE = os.environ.get("SOURCE_CHANNEL", "").strip().lstrip("@")
 
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
@@ -168,6 +168,17 @@ def run_web():
     web_app.run(host="0.0.0.0", port=port)
 
 
+def resolve_source_channel():
+    if not RAW_SOURCE:
+        return None
+    if re.fullmatch(r"-?\d+", RAW_SOURCE):
+        return int(RAW_SOURCE)
+    return RAW_SOURCE
+
+
+SOURCE_CHANNEL = resolve_source_channel()
+
+
 @client.on(events.NewMessage(chats=SOURCE_CHANNEL))
 async def on_channel_post(event):
     raw_text = event.raw_text or ""
@@ -180,6 +191,13 @@ async def on_channel_post(event):
     send_bot_msg(TARGET_CHAT_ID, format_signal_card(sig))
 
 
+async def list_dialogs_on_start():
+    print("📋 Список каналов/чатов аккаунта:")
+    async for dialog in client.iter_dialogs(limit=50):
+        if dialog.is_channel or dialog.is_group:
+            print(f"  - {dialog.name} | ID: {dialog.id}")
+
+
 if __name__ == "__main__":
     required = [API_ID, API_HASH, SESSION_STRING, BOT_TOKEN, TARGET_CHAT_ID, SOURCE_CHANNEL]
     if not all(required):
@@ -187,6 +205,8 @@ if __name__ == "__main__":
 
     threading.Thread(target=run_web, daemon=True).start()
     threading.Thread(target=poll_bot_replies, daemon=True).start()
-    print("🚀 Слушатель канала запущен...")
+
     client.start()
+    client.loop.run_until_complete(list_dialogs_on_start())
+    print(f"🚀 Слушатель канала запущен (цель: {SOURCE_CHANNEL})...")
     client.run_until_disconnected()
