@@ -22,7 +22,6 @@ asyncio.set_event_loop(loop)
 API_ID = int(os.environ.get("TG_API_ID", "0"))
 API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_STRING = os.environ.get("TG_SESSION_STRING", "")
-
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TARGET_CHAT_ID = int(os.environ.get("TG_CHAT_ID", "0"))
 
@@ -36,11 +35,9 @@ BE_CHECK_INTERVAL_SEC = 900
 TRADES_STATE_FILE = "tracked_trades.json"
 DEFAULT_STOP_LOSS_PCT = 10.0
 
-
 # ==========================================
 # НОРМАЛИЗАЦИЯ МОНЕТ И ГИБКИЙ ПАРСЕР
 # ==========================================
-
 NON_TICKER_WORDS = {
     "LONG",
     "SHORT",
@@ -122,7 +119,7 @@ def normalize_symbol(raw_symbol: str) -> str:
 
 def detect_side(text: str) -> str:
   m = re.search(
-      r"(?:^|[\s\(\[\|/#*•\-–—])(LONG|SHORT|ЛОНГ|ШОРТ|BUY|SELL)(?:$|[\s\)\]\.,!?:;*•\-–—])",
+      r"(?:^|[\s\(\[\|/#*•\-–—])(LONG|SHORT|ЛОНГ|ШОРТ|BUY|SELL)(?=\s|$|[\)\]\.,!?:;*•\-–—]|[xхXХ]?\d)",
       text,
       re.IGNORECASE | re.MULTILINE,
   )
@@ -132,7 +129,6 @@ def detect_side(text: str) -> str:
       return "LONG"
     if tok in ("SHORT", "ШОРТ", "SELL"):
       return "SHORT"
-
   if re.search(r"🟢|📈|лонг\w*|покуп\w*", text, re.IGNORECASE):
     return "LONG"
   if re.search(r"🔴|📉|🔻|шорт\w*|продаж\w*", text, re.IGNORECASE):
@@ -194,7 +190,6 @@ def extract_entry(text: str):
           re.IGNORECASE,
       ):
         return None, [], True
-
       nums = [
           parse_num(x)
           for x in re.findall(NUM_RE, line)
@@ -204,7 +199,6 @@ def extract_entry(text: str):
         if len(nums) >= 2 and abs(nums[1] - nums[0]) / max(nums[0], 1e-9) < 0.25:
           return nums[0], nums[:2], False
         return nums[0], nums[:1], False
-
   return None, [], True
 
 
@@ -223,7 +217,6 @@ def default_shares_for_count(n: int, custom_shares=None) -> list:
 
 def extract_tps(text: str, custom_shares=None) -> list:
   tps = []
-
   block_match = re.search(
       r"(?:Тейк-профит\w*|Тейк\w*|Цел[ьяи]|TPs?|Таргет\w*)\s*[:\-–—]?\s*(.*?)(?=\n\s*(?:Стоп\w*|СЛ|SL\b|Риск\b|Банк\b|Плеч\w*)|\Z)",
       text,
@@ -231,7 +224,6 @@ def extract_tps(text: str, custom_shares=None) -> list:
   )
   if block_match:
     block = block_match.group(1)
-
     pct_items = []
     for m in re.finditer(
         rf"({NUM_RE})\s*\(\s*({NUM_RE})\s*%\s*\)",
@@ -260,7 +252,6 @@ def extract_tps(text: str, custom_shares=None) -> list:
         val = parse_num(num_str)
         if val > 0:
           prices.append(val)
-
     if prices:
       shares = default_shares_for_count(len(prices), custom_shares)
       for i, p in enumerate(prices):
@@ -276,12 +267,10 @@ def extract_tps(text: str, custom_shares=None) -> list:
     val = parse_num(m.group(1))
     if val > 0:
       line_tps.append(val)
-
   if line_tps:
     shares = default_shares_for_count(len(line_tps), custom_shares)
     for i, p in enumerate(line_tps):
       tps.append({"price": p, "share_pct": shares[i]})
-
   return tps
 
 
@@ -301,22 +290,17 @@ def extract_stop(text: str):
 def parse_flexible_signal(text: str, cfg: dict = None):
   if not text or not text.strip():
     return None
-
   clean_text = text.strip()
   symbol = detect_symbol(clean_text)
   side = detect_side(clean_text)
-
   if not symbol or not side:
     return None
-
   entry_price, entry_candidates, _ = extract_entry(clean_text)
   custom_shares = (cfg or {}).get("tp_shares")
   tps = extract_tps(clean_text, custom_shares=custom_shares)
   stop_price = extract_stop(clean_text)
-
   if not tps and stop_price is None and entry_price is None:
     return None
-
   return {
       "symbol": symbol,
       "side": side,
@@ -339,7 +323,6 @@ def to_telethon_channel_id(raw_id: int) -> int:
 # ==========================================
 # РЕЕСТР КАНАЛОВ И ИХ ПРАВИЛ ТОРГОВЛИ
 # ==========================================
-
 CHANNEL_CONFIGS = {
     to_telethon_channel_id(3845170751): {
         "name": "Нестеров",
@@ -385,13 +368,10 @@ CHANNEL_CONFIGS = {
     },
 }
 
-
 # ==========================================
 # СЕРВИСНЫЕ ФУНКЦИИ И OKX API
 # ==========================================
-
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
-
 pending_signals = {}
 tracked_trades = {}
 last_be_check_ts = 0.0
@@ -484,7 +464,6 @@ def okx_request(method: str, path: str, params: dict = None, data: dict = None):
   body = json.dumps(data, separators=(",", ":")) if data else ""
   ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
   sign = okx_sign(ts, method, request_path, body)
-
   headers = {
       "OK-ACCESS-KEY": OKX_API_KEY,
       "OK-ACCESS-SIGN": sign,
@@ -492,13 +471,11 @@ def okx_request(method: str, path: str, params: dict = None, data: dict = None):
       "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE,
       "Content-Type": "application/json",
   }
-
   url = f"{OKX_BASE_URL}{request_path}"
   if method.upper() == "GET":
     resp = requests.get(url, headers=headers, timeout=15)
   else:
     resp = requests.post(url, headers=headers, data=body, timeout=15)
-
   parsed = resp.json()
   if parsed.get("code") != "0":
     raise RuntimeError(
@@ -623,7 +600,6 @@ def place_stop_loss_algo(
     sl_payload["posSide"] = pos_side
   else:
     sl_payload["reduceOnly"] = True
-
   sl_res = okx_request("POST", "/api/v5/trade/order-algo", data=sl_payload)
   return sl_res[0].get("algoId") if sl_res else "?"
 
@@ -685,15 +661,12 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
   side = sig["side"]
   is_long = side == "LONG"
   order_type = sig.get("order_type", "limit")
-
   pos_mode = get_account_pos_mode()
   is_hedge = pos_mode == "long_short_mode"
   pos_side = ("long" if is_long else "short") if is_hedge else None
-
   spec = get_instrument_spec(inst_id)
   max_lev = get_max_cross_leverage(inst_id, pos_mode, side)
   set_cross_leverage(inst_id, max_lev, pos_mode, side)
-
   lever_dec = Decimal(str(max_lev))
   margin_dec = Decimal(str(margin_usdt))
 
@@ -706,14 +679,12 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
 
   ct_val_dec = Decimal(str(spec["ctVal"]))
   min_sz_dec = Decimal(str(spec["minSz"]))
-
   if entry_px_dec <= 0 or ct_val_dec <= 0:
     raise RuntimeError("Некорректная цена входа или размер контракта")
 
   notional_usdt = margin_dec * lever_dec
   raw_contracts = notional_usdt / (entry_px_dec * ct_val_dec)
   total_sz = round_step(float(raw_contracts), spec["lotSz"], ROUND_DOWN)
-
   if total_sz < min_sz_dec:
     raise RuntimeError(
         f"Рассчитанный объём {fmt_dec(total_sz)} меньше минимума биржи"
@@ -722,7 +693,6 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
 
   entry_side = "buy" if is_long else "sell"
   close_side = "sell" if is_long else "buy"
-
   entry_payload = {
       "instId": inst_id,
       "tdMode": "cross",
@@ -737,8 +707,8 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
 
   entry_res = okx_request("POST", "/api/v5/trade/order", data=entry_payload)
   entry_ord_id = entry_res[0].get("ordId") if entry_res else "?"
-
   actual_entry_px_dec = entry_px_dec
+
   if order_type == "market" and entry_ord_id and entry_ord_id != "?":
     try:
       time.sleep(0.4)
@@ -756,7 +726,6 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
   if tps:
     allocated_sz = Decimal("0")
     total_share = sum(Decimal(str(t["share_pct"])) for t in tps)
-
     for idx, tp in enumerate(tps):
       tp_px_dec = round_step(tp["price"], spec["tickSz"], ROUND_HALF_UP)
       if idx < len(tps) - 1:
@@ -776,7 +745,6 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
         tp_sz = round_step(
             float(total_sz - allocated_sz), spec["lotSz"], ROUND_DOWN
         )
-
       if tp_sz <= 0:
         continue
 
@@ -857,23 +825,18 @@ def check_open_positions_breakeven():
   if now - last_be_check_ts < BE_CHECK_INTERVAL_SEC:
     return
   last_be_check_ts = now
-
   try:
     open_positions = get_all_open_swap_positions()
     if not open_positions:
       return
-
     pending_algos = get_all_pending_algo_orders()
-
     for pos_row in open_positions:
       inst_id = pos_row.get("instId", "")
       if not inst_id:
         continue
-
       raw_pos = Decimal(str(pos_row.get("pos", "0") or "0"))
       if raw_pos == 0:
         continue
-
       pos_side_raw = (pos_row.get("posSide") or "net").lower()
       if pos_side_raw == "long":
         is_long = True
@@ -887,34 +850,27 @@ def check_open_positions_breakeven():
         is_long = raw_pos > 0
         is_hedge = False
         pos_side = None
-
       close_side = "sell" if is_long else "buy"
       abs_pos = abs(raw_pos)
-
       avg_px_str = pos_row.get("avgPx") or "0"
       avg_px_val = Decimal(str(avg_px_str))
       if avg_px_val <= 0:
         continue
-
       trade_key = f"{inst_id}:{pos_side or ('LONG' if is_long else 'SHORT')}"
       tr = tracked_trades.get(trade_key, {})
       if tr.get("be_moved"):
         continue
-
       spec = get_instrument_spec(inst_id)
       min_sz_dec = Decimal(str(spec["minSz"]))
       new_sl_sz = round_step(float(abs_pos), spec["lotSz"], ROUND_DOWN)
       if new_sl_sz < min_sz_dec:
         continue
-
       be_px_dec = round_step(float(avg_px_val), spec["tickSz"], ROUND_HALF_UP)
-
       tp1_reached = False
       tp1_algo_id = tr.get("tp1_algo_id")
       if tp1_algo_id and tp1_algo_id != "—":
         if get_algo_order_status(inst_id, tp1_algo_id) == "effective":
           tp1_reached = True
-
       if not tp1_reached and tr.get("tp1_px"):
         tp1_px_val = Decimal(str(tr["tp1_px"]))
         mkt_px = Decimal(str(get_market_price(inst_id)))
@@ -922,10 +878,8 @@ def check_open_positions_breakeven():
           tp1_reached = True
         elif (not is_long) and mkt_px <= tp1_px_val:
           tp1_reached = True
-
       if not tp1_reached:
         continue
-
       matching_sl_ids = []
       already_at_be = False
       for a in pending_algos:
@@ -943,12 +897,10 @@ def check_open_positions_breakeven():
               already_at_be = True
           except Exception:
             pass
-
       if already_at_be:
         tracked_trades[trade_key] = {**tr, "be_moved": True}
         save_tracked_trades()
         continue
-
       cancel_algo_orders(inst_id, matching_sl_ids)
       new_sl_algo_id = place_stop_loss_algo(
           inst_id=inst_id,
@@ -958,7 +910,6 @@ def check_open_positions_breakeven():
           is_hedge=is_hedge,
           pos_side=pos_side,
       )
-
       tracked_trades[trade_key] = {
           **tr,
           "inst_id": inst_id,
@@ -967,7 +918,6 @@ def check_open_positions_breakeven():
           "be_moved": True,
       }
       save_tracked_trades()
-
       src_line = (
           f"• Источник: *{tr['source_name']}*\n" if tr.get("source_name") else ""
       )
@@ -991,7 +941,6 @@ def format_signal_card(sig: dict) -> str:
   source_name = sig.get("source_name", "Неизвестный канал")
   order_type = sig.get("order_type", "limit")
   candidates = sig.get("entry_candidates") or []
-
   if order_type == "market":
     entry_label = "По рынку (MARKET)"
   elif len(candidates) >= 2:
@@ -1002,7 +951,6 @@ def format_signal_card(sig: dict) -> str:
     entry_label = f"`{sig['entry_price']}` (лимит)"
   else:
     entry_label = "По рынку (MARKET)"
-
   tps = sig.get("tps") or []
   if len(tps) == 1:
     tp_block = f"• Тейк: `{tps[0]['price']}` ({tps[0]['share_pct']}%)"
@@ -1013,13 +961,11 @@ def format_signal_card(sig: dict) -> str:
     )
   else:
     tp_block = "• Тейки: не заданы"
-
   if sig.get("stop_price") is not None:
     sl_label = f"`{sig['stop_price']}`"
   else:
     sl_pct = sig.get("default_sl_pct") or DEFAULT_STOP_LOSS_PCT
     sl_label = f"авто `{sl_pct}%` от входа"
-
   emoji = "🟢" if sig["side"] == "LONG" else "🔴"
   return (
       f"{emoji} *Новый сигнал: `{sig['symbol']}` — {sig['side']}*\n"
@@ -1050,13 +996,10 @@ def poll_bot_replies():
           msg = upd.get("message")
           if not msg:
             continue
-
           chat_id = msg["chat"]["id"]
           text = (msg.get("text") or "").strip()
-
           if chat_id != TARGET_CHAT_ID or chat_id not in pending_signals:
             continue
-
           if text.lower() in ("skip", "отмена", "пропустить"):
             skipped = pending_signals.pop(chat_id)
             send_bot_msg(
@@ -1065,7 +1008,6 @@ def poll_bot_replies():
                 f" ({skipped.get('source_name', '')}) пропущен.",
             )
             continue
-
           try:
             margin = float(text.replace(",", "."))
             if margin <= 0:
@@ -1077,7 +1019,6 @@ def poll_bot_replies():
                 " `skip`.",
             )
             continue
-
           sig = pending_signals.pop(chat_id)
           print(
               f"⚡ Отправляем на OKX [{sig.get('source_name')}]: {sig} | Маржа:"
@@ -1127,7 +1068,6 @@ async def process_channel_message(event, event_kind: str):
   cfg = CHANNEL_CONFIGS.get(event.chat_id)
   if not cfg:
     return
-
   raw_text = event.raw_text or ""
   parser_fn = cfg.get("parser") or parse_flexible_signal
   try:
@@ -1136,15 +1076,13 @@ async def process_channel_message(event, event_kind: str):
     sig = parser_fn(raw_text)
 
   if not sig:
-    if raw_text.strip():
-      preview = raw_text.strip().replace("\n", " | ")[:220]
-      print(
-          f"ℹ️ [{event_kind}] Пост в [{cfg['name']}] не распознан: {preview}",
-          flush=True,
-      )
+    preview = raw_text.strip().replace("\n", " | ")[:220]
+    print(
+        f"ℹ️ [{event_kind}] Пост в [{cfg['name']}] не распознан: {preview!r}",
+        flush=True,
+    )
     return
 
-  # Не перезаписываем активный сигнал в ожидании, если пришёл дубль при редактировании
   if TARGET_CHAT_ID in pending_signals:
     prev = pending_signals[TARGET_CHAT_ID]
     if (
@@ -1157,7 +1095,9 @@ async def process_channel_message(event, event_kind: str):
   sig["source_id"] = event.chat_id
   sig["source_name"] = cfg["name"]
   sig["order_type"] = (
-      "market" if sig.get("entry_price") is None else cfg.get("order_type", "limit")
+      "market"
+      if sig.get("entry_price") is None
+      else cfg.get("order_type", "limit")
   )
   sig["default_sl_pct"] = cfg.get("default_sl_pct", DEFAULT_STOP_LOSS_PCT)
 
@@ -1166,14 +1106,28 @@ async def process_channel_message(event, event_kind: str):
   send_bot_msg(TARGET_CHAT_ID, format_signal_card(sig))
 
 
-@client.on(events.NewMessage(chats=list(CHANNEL_CONFIGS.keys())))
+@client.on(events.NewMessage())
 async def on_channel_post(event):
-  await process_channel_message(event, "NewMessage")
+  if event.is_channel or event.is_group:
+    in_cfg = event.chat_id in CHANNEL_CONFIGS
+    txt = (event.raw_text or "").replace("\n", " ")[:140]
+    print(
+        f"📥 [NewMessage] chat_id={event.chat_id} in_cfg={in_cfg} text={txt!r}",
+        flush=True,
+    )
+  if event.chat_id in CHANNEL_CONFIGS:
+    await process_channel_message(event, "NewMessage")
 
 
-@client.on(events.MessageEdited(chats=list(CHANNEL_CONFIGS.keys())))
+@client.on(events.MessageEdited())
 async def on_channel_edit(event):
-  await process_channel_message(event, "MessageEdited")
+  if event.chat_id in CHANNEL_CONFIGS:
+    print(
+        f"✏️ [MessageEdited] chat_id={event.chat_id}"
+        f" name={CHANNEL_CONFIGS[event.chat_id]['name']}",
+        flush=True,
+    )
+    await process_channel_message(event, "MessageEdited")
 
 
 async def start_services():
@@ -1182,6 +1136,7 @@ async def start_services():
     print("❌ Сессия НЕ авторизована! Проверь TG_SESSION_STRING.", flush=True)
     return
 
+  await client.get_dialogs()
   me = await client.get_me()
   channels_str = ", ".join(
       f"{cfg['name']} ({cid})" for cid, cfg in CHANNEL_CONFIGS.items()
