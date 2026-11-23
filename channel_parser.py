@@ -34,8 +34,20 @@ OKX_BASE_URL = "https://www.okx.com"
 
 
 # ==========================================
-# ПАРСЕРЫ ПО КАНАЛАМ
+# НОРМАЛИЗАЦИЯ МОНЕТ И ПАРСЕРЫ ПО КАНАЛАМ
 # ==========================================
+
+
+def normalize_symbol(raw_symbol: str) -> str:
+  cleaned = (
+      re.sub(r"[^A-Za-z0-9]", "", (raw_symbol or "").upper())
+      .replace("USDT", "")
+      .replace("SWAP", "")
+      .replace("PERP", "")
+  )
+  if not cleaned:
+    return ""
+  return f"{cleaned}USDT"
 
 
 def parse_nesterov(text: str):
@@ -43,15 +55,17 @@ def parse_nesterov(text: str):
     return None
 
   header_match = re.search(
-      r"\b([A-Z0-9_]+USDT)\s*\|\s*(LONG|SHORT)\b",
+      r"\b([A-Za-z0-9_]+(?:/?USDT)?)\s*\|\s*(LONG|SHORT)\b",
       text,
       re.IGNORECASE,
   )
   if not header_match:
     return None
 
-  symbol = header_match.group(1).upper()
+  symbol = normalize_symbol(header_match.group(1))
   side = header_match.group(2).upper()
+  if not symbol:
+    return None
 
   tbx_match = re.search(r"ТВХ\s*:\s*([0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE)
   if not tbx_match:
@@ -89,16 +103,69 @@ def parse_nesterov(text: str):
   }
 
 
+def parse_roman_robertovich(text: str):
+  if not text:
+    return None
+
+  header_match = re.search(
+      r"(?:^|\n)\s*\$?\s*([A-Za-z0-9_]+(?:/?USDT)?)\s+(LONG|SHORT)\b",
+      text,
+      re.IGNORECASE,
+  )
+  if not header_match:
+    return None
+
+  symbol = normalize_symbol(header_match.group(1))
+  side = header_match.group(2).upper()
+  if not symbol:
+    return None
+
+  tp_match = re.search(
+      r"Тейк(?:-профит)?\s*:\s*([0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE
+  )
+  if not tp_match:
+    return None
+  tp_price = float(tp_match.group(1).replace(",", "."))
+
+  sl_match = re.search(
+      r"Стоп(?:-лосс)?\s*:\s*([0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE
+  )
+  stop_price = float(sl_match.group(1).replace(",", ".")) if sl_match else None
+
+  return {
+      "symbol": symbol,
+      "side": side,
+      "entry_price": None,
+      "tps": [{"price": tp_price, "share_pct": 100.0}],
+      "stop_price": stop_price,
+  }
+
+
+def to_telethon_channel_id(raw_id: int) -> int:
+  if raw_id < 0:
+    return raw_id
+  s = str(raw_id)
+  if s.startswith("100") and len(s) > 10:
+    return int(f"-{s}")
+  return int(f"-100{s}")
+
+
 # ==========================================
 # РЕЕСТР КАНАЛОВ И ИХ ПРАВИЛ ТОРГОВЛИ
 # ==========================================
 
 CHANNEL_CONFIGS = {
-    -1003845170751: {
+    to_telethon_channel_id(3845170751): {
         "name": "Нестеров",
         "parser": parse_nesterov,
-        "order_type": "limit",  # "limit" или "market"
-        "default_sl_pct": None,  # если None — берём стоп строго из сигнала
+        "order_type": "limit",
+        "default_sl_pct": None,
+    },
+    to_telethon_channel_id(2254922481): {
+        "name": "Роман Робертович",
+        "parser": parse_roman_robertovich,
+        "order_type": "market",
+        "default_sl_pct": None,
     },
 }
 
@@ -133,11 +200,11 @@ def send_bot_msg(chat_id: int, text: str):
 
 
 def symbol_to_inst_id(symbol: str) -> str:
-  clean = symbol.upper().replace("-SWAP", "").replace("/", "")
-  if clean.endswith("USDT") and len(clean) > 4:
-    base = clean[:-4]
-    return f"{base}-USDT-SWAP"
-  return f"{clean}-SWAP"
+  norm = normalize_symbol(symbol)
+  if not norm:
+    raise RuntimeError(f"Некорректный символ монеты: {symbol}")
+  base = norm[:-4]
+  return f"{base}-USDT-SWAP"
 
 
 def round_step(value: float, step_str: str, mode=ROUND_DOWN) -> Decimal:
@@ -330,7 +397,7 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
   entry_res = okx_request("POST", "/api/v5/trade/order", data=entry_payload)
   entry_ord_id = entry_res[0].get("ordId") if entry_res else "?"
 
-  # 2. Лесенка тейков (TP), если заданы в сигнале
+  # 2. Тейк-профит (один или лесенка), если заданы в сигнале
   tp_results = []
   tps = sig.get("tps") or []
   if tps:
@@ -438,7 +505,9 @@ def format_signal_card(sig: dict) -> str:
   )
 
   tps = sig.get("tps") or []
-  if tps:
+  if len(tps) == 1:
+    tp_block = f"• Тейк: `{tps[0]['price']}` ({tps[0]['share_pct']}%)"
+  elif len(tps) > 1:
     tp_block = "• Тейки лесенкой:\n" + "\n".join(
         f"  • TP{i+1}: `{tp['price']}` ({tp['share_pct']}%)"
         for i, tp in enumerate(tps)
