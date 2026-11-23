@@ -34,347 +34,292 @@ OKX_BASE_URL = "https://www.okx.com"
 
 BE_CHECK_INTERVAL_SEC = 900
 TRADES_STATE_FILE = "tracked_trades.json"
+DEFAULT_STOP_LOSS_PCT = 10.0
 
 
 # ==========================================
-# НОРМАЛИЗАЦИЯ МОНЕТ И ПАРСЕРЫ ПО КАНАЛАМ
+# НОРМАЛИЗАЦИЯ МОНЕТ И ГИБКИЙ ПАРСЕР
 # ==========================================
+
+NON_TICKER_WORDS = {
+    "LONG",
+    "SHORT",
+    "ЛОНГ",
+    "ШОРТ",
+    "BUY",
+    "SELL",
+    "TP",
+    "TP1",
+    "TP2",
+    "TP3",
+    "TP4",
+    "TP5",
+    "SL",
+    "STOP",
+    "СТОП",
+    "ЦЕЛЬ",
+    "ЦЕЛИ",
+    "ТЕЙК",
+    "ТЕЙКИ",
+    "ВХОД",
+    "ТВХ",
+    "РЫНОК",
+    "MARKET",
+    "LIMIT",
+    "ЛИМИТ",
+    "КРОСС",
+    "CROSS",
+    "ISOLATED",
+    "ИЗОЛЯ",
+    "ПЛЕЧО",
+    "РИСК",
+    "БАНК",
+    "USDT",
+    "USDC",
+    "USD",
+    "SWAP",
+    "PERP",
+    "SPOT",
+    "СПОТ",
+    "ПО",
+    "НА",
+    "ОТ",
+    "ДО",
+    "И",
+    "В",
+    "ЗА",
+    "Х",
+}
+
+NUM_RE = r"[0-9]+(?:[.,][0-9]+)?"
+
+
+def parse_num(raw: str) -> float:
+  return float(raw.strip().replace(",", "."))
 
 
 def normalize_symbol(raw_symbol: str) -> str:
   cleaned = (
       re.sub(r"[^A-Za-z0-9]", "", (raw_symbol or "").upper())
       .replace("USDT", "")
+      .replace("USDC", "")
       .replace("SWAP", "")
       .replace("PERP", "")
   )
-  if not cleaned:
+  if not cleaned or cleaned in NON_TICKER_WORDS:
     return ""
   return f"{cleaned}USDT"
 
 
-def parse_nesterov(text: str):
-  if not text:
-    return None
-
-  header_match = re.search(
-      r"\b([A-Za-z0-9_]+(?:/?USDT)?)\s*\|\s*(LONG|SHORT)\b",
+def detect_side(text: str) -> str:
+  m = re.search(
+      r"(?:^|[\s\(\[\|/#*•\-–—])(LONG|SHORT|ЛОНГ|ШОРТ|BUY|SELL)(?:$|[\s\)\]\.,!?:;*•\-–—])",
       text,
-      re.IGNORECASE,
+      re.IGNORECASE | re.MULTILINE,
   )
-  if not header_match:
-    return None
+  if m:
+    tok = m.group(1).upper()
+    if tok in ("LONG", "ЛОНГ", "BUY"):
+      return "LONG"
+    if tok in ("SHORT", "ШОРТ", "SELL"):
+      return "SHORT"
 
-  symbol = normalize_symbol(header_match.group(1))
-  side = header_match.group(2).upper()
-  if not symbol:
-    return None
-
-  tbx_match = re.search(r"ТВХ\s*:\s*([0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE)
-  if not tbx_match:
-    return None
-  entry_price = float(tbx_match.group(1).replace(",", "."))
-
-  tp_section_match = re.search(
-      r"Тейк-профит\s*:\s*(.*?)(?=\n\s*Стоп\s*:|\Z)",
-      text,
-      re.IGNORECASE | re.DOTALL,
-  )
-  tps = []
-  if tp_section_match:
-    tp_lines = tp_section_match.group(1)
-    for m in re.finditer(
-        r"([0-9]+(?:[.,][0-9]+)?)\s*\(\s*([0-9]+(?:[.,][0-9]+)?)\s*%\s*\)",
-        tp_lines,
-    ):
-      price = float(m.group(1).replace(",", "."))
-      share = float(m.group(2).replace(",", "."))
-      tps.append({"price": price, "share_pct": share})
-
-  sl_match = re.search(r"Стоп\s*:\s*([0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE)
-  stop_price = float(sl_match.group(1).replace(",", ".")) if sl_match else None
-
-  if not tps or stop_price is None:
-    return None
-
-  return {
-      "symbol": symbol,
-      "side": side,
-      "entry_price": entry_price,
-      "tps": tps,
-      "stop_price": stop_price,
-  }
+  if re.search(r"🟢|📈|🚀|лонг\w*|покуп\w*", text, re.IGNORECASE):
+    return "LONG"
+  if re.search(r"🔴|📉|🔻|шорт\w*|продаж\w*", text, re.IGNORECASE):
+    return "SHORT"
+  return ""
 
 
-def parse_roman_robertovich(text: str):
-  if not text:
-    return None
+def detect_symbol(text: str) -> str:
+  pair_patterns = [
+      r"[#\$]?\b([A-Za-z0-9]{2,15})\s*[/\-_]\s*(?:USDT|USDC|USD|PERP|SWAP)\b",
+      r"[#\$]?\b([A-Za-z0-9]{2,15})(?:USDT|USDC)\b",
+  ]
+  for pat in pair_patterns:
+    for m in re.finditer(pat, text, re.IGNORECASE):
+      sym = normalize_symbol(m.group(1))
+      if sym:
+        return sym
 
-  header_match = re.search(
-      r"(?:^|\n)\s*\$?\s*([A-Za-z0-9_]+(?:/?USDT)?)\s+(LONG|SHORT)\b",
-      text,
-      re.IGNORECASE,
-  )
-  if not header_match:
-    return None
+  for m in re.finditer(r"[#\$]([A-Za-z0-9]{2,15})\b", text):
+    sym = normalize_symbol(m.group(1))
+    if sym:
+      return sym
 
-  symbol = normalize_symbol(header_match.group(1))
-  side = header_match.group(2).upper()
-  if not symbol:
-    return None
-
-  tp_match = re.search(
-      r"Тейк(?:-профит)?\s*:\s*([0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE
-  )
-  if not tp_match:
-    return None
-  tp_price = float(tp_match.group(1).replace(",", "."))
-
-  sl_match = re.search(
-      r"Стоп(?:-лосс)?\s*:\s*([0-9]+(?:[.,][0-9]+)?)", text, re.IGNORECASE
-  )
-  stop_price = float(sl_match.group(1).replace(",", ".")) if sl_match else None
-
-  return {
-      "symbol": symbol,
-      "side": side,
-      "entry_price": None,
-      "tps": [{"price": tp_price, "share_pct": 100.0}],
-      "stop_price": stop_price,
-  }
-
-
-def parse_altcentr(text: str):
-  if not text:
-    return None
-
-  sym_match = re.search(
-      r"#?\s*([A-Za-z0-9_]+)\s*/\s*USDT\b",
-      text,
-      re.IGNORECASE,
-  )
-  if not sym_match:
-    return None
-  symbol = normalize_symbol(sym_match.group(1))
-  if not symbol:
-    return None
-
-  side_match = re.search(
-      r"\(\s*(LONG|SHORT|ЛОНГ|ШОРТ)\s*\)|\b(LONG|SHORT|ЛОНГ|ШОРТ)\b",
-      text,
-      re.IGNORECASE,
-  )
-  if not side_match:
-    return None
-  raw_side = (side_match.group(1) or side_match.group(2)).upper()
-  side = "LONG" if raw_side in ("LONG", "ЛОНГ") else "SHORT"
-
-  entry_match = re.search(
-      r"Точка\s+входа\s*:\s*([0-9]+(?:[.,][0-9]+)?)",
-      text,
-      re.IGNORECASE,
-  )
-  if not entry_match:
-    return None
-  entry_price = float(entry_match.group(1).replace(",", "."))
-
-  targets_section = re.search(
-      r"Цели\s*:\s*(.*?)(?=\n\s*Стоп\s*:|\Z)",
-      text,
-      re.IGNORECASE | re.DOTALL,
-  )
-  if not targets_section:
-    return None
-
-  target_prices = []
   for m in re.finditer(
-      r"(?:^|\n)\s*[1-9][0-9]*\s*[\)\.\-:]\s*([0-9]+(?:[.,][0-9]+)?)",
-      targets_section.group(1),
+      r"\b([A-Za-z0-9]{2,15})\b\s*[\|\-–—:]?\s*\b(?:LONG|SHORT|ЛОНГ|ШОРТ)\b",
+      text,
+      re.IGNORECASE,
   ):
-    target_prices.append(float(m.group(1).replace(",", ".")))
+    sym = normalize_symbol(m.group(1))
+    if sym:
+      return sym
 
-  if len(target_prices) < 3:
-    return None
+  for m in re.finditer(
+      r"\b(?:LONG|SHORT|ЛОНГ|ШОРТ)\b\s*[\|\-–—:]?\s*\b([A-Za-z0-9]{2,15})\b",
+      text,
+      re.IGNORECASE,
+  ):
+    sym = normalize_symbol(m.group(1))
+    if sym:
+      return sym
 
-  shares = [50.0, 25.0, 25.0]
-  tps = [
-      {"price": target_prices[i], "share_pct": shares[i]}
-      for i in range(3)
+  head = "\n".join(text.splitlines()[:4])
+  for m in re.finditer(r"\b([A-Z0-9]{2,12})\b", head):
+    cand = m.group(1).upper()
+    if cand.isdigit():
+      continue
+    sym = normalize_symbol(cand)
+    if sym:
+      return sym
+
+  return ""
+
+
+def extract_entry(text: str):
+  entry_patterns = [
+      r"(?:ТВХ|Точка\s+входа|Вход\s*(?:в\s+сделку|в\s+позицию)?|Entry)\s*[:\-–—]?\s*([^\n]+)",
   ]
+  for pat in entry_patterns:
+    m = re.search(pat, text, re.IGNORECASE)
+    if m:
+      line = m.group(1).strip()
+      if re.search(
+          r"по\s+рынку|рынок|с\s+рынка|market|mkt|по\s+тек\w*|current",
+          line,
+          re.IGNORECASE,
+      ):
+        return None, [], True
 
-  sl_match = re.search(
-      r"Стоп(?:-лосс)?\s*:\s*([0-9]+(?:[.,][0-9]+)?)",
+      nums = [
+          parse_num(x)
+          for x in re.findall(NUM_RE, line)
+          if parse_num(x) > 0
+      ]
+      if nums:
+        if len(nums) >= 2 and abs(nums[1] - nums[0]) / max(nums[0], 1e-9) < 0.25:
+          return nums[0], nums[:2], False
+        return nums[0], nums[:1], False
+
+  return None, [], True
+
+
+def default_shares_for_count(n: int, custom_shares=None) -> list:
+  if n <= 0:
+    return []
+  if custom_shares and len(custom_shares) >= n:
+    return [float(x) for x in custom_shares[:n]]
+  if n == 1:
+    return [100.0]
+  if n == 3:
+    return [50.0, 25.0, 25.0]
+  equal = round(100.0 / n, 2)
+  return [equal for _ in range(n)]
+
+
+def extract_tps(text: str, custom_shares=None) -> list:
+  tps = []
+
+  block_match = re.search(
+      r"(?:Тейк-профит\w*|Тейк\w*|Цел[ьяи]|TPs?|Таргет\w*)\s*[:\-–—]?\s*(.*?)(?=\n\s*(?:Стоп\w*|СЛ|SL\b|Риск\b|Банк\b|Плеч\w*)|\Z)",
+      text,
+      re.IGNORECASE | re.DOTALL,
+  )
+  if block_match:
+    block = block_match.group(1)
+
+    pct_items = []
+    for m in re.finditer(
+        rf"({NUM_RE})\s*\(\s*({NUM_RE})\s*%\s*\)",
+        block,
+    ):
+      px = parse_num(m.group(1))
+      sh = parse_num(m.group(2))
+      if px > 0:
+        pct_items.append({"price": px, "share_pct": sh})
+    if pct_items:
+      return pct_items
+
+    prices = []
+    for line in block.splitlines():
+      s = line.strip()
+      if not s:
+        continue
+      s_clean = re.sub(
+          r"^\s*(?:TP\s*\d+|Т\s*\d+|Цель\s*\d+|\d+)\s*[\)\.\-:]\s*",
+          "",
+          s,
+          flags=re.IGNORECASE,
+      )
+      s_clean = re.sub(r"\(\s*[0-9]+(?:[.,][0-9]+)?\s*%\s*\)", "", s_clean)
+      for num_str in re.findall(NUM_RE, s_clean):
+        val = parse_num(num_str)
+        if val > 0:
+          prices.append(val)
+
+    if prices:
+      shares = default_shares_for_count(len(prices), custom_shares)
+      for i, p in enumerate(prices):
+        tps.append({"price": p, "share_pct": shares[i]})
+      return tps
+
+  line_tps = []
+  for m in re.finditer(
+      rf"(?:TP\s*\d+|Т\s*\d+|Цель\s*\d+|Тейк\s*\d+)\s*[:\-–—]?\s*({NUM_RE})",
+      text,
+      re.IGNORECASE,
+  ):
+    val = parse_num(m.group(1))
+    if val > 0:
+      line_tps.append(val)
+
+  if line_tps:
+    shares = default_shares_for_count(len(line_tps), custom_shares)
+    for i, p in enumerate(line_tps):
+      tps.append({"price": p, "share_pct": shares[i]})
+
+  return tps
+
+
+def extract_stop(text: str):
+  m = re.search(
+      rf"(?:Стоп(?:-лосс)?|СЛ|SL|Stop(?:-loss)?)\s*[:\-–—]?\s*({NUM_RE})",
       text,
       re.IGNORECASE,
   )
-  stop_price = float(sl_match.group(1).replace(",", ".")) if sl_match else None
-  if stop_price is None:
+  if m:
+    val = parse_num(m.group(1))
+    if val > 0:
+      return val
+  return None
+
+
+def parse_flexible_signal(text: str, cfg: dict = None):
+  if not text or not text.strip():
+    return None
+
+  clean_text = text.strip()
+  symbol = detect_symbol(clean_text)
+  side = detect_side(clean_text)
+
+  if not symbol or not side:
+    return None
+
+  entry_price, entry_candidates, _ = extract_entry(clean_text)
+  custom_shares = (cfg or {}).get("tp_shares")
+  tps = extract_tps(clean_text, custom_shares=custom_shares)
+  stop_price = extract_stop(clean_text)
+
+  if not tps and stop_price is None and entry_price is None:
     return None
 
   return {
       "symbol": symbol,
       "side": side,
       "entry_price": entry_price,
+      "entry_candidates": entry_candidates,
       "tps": tps,
-      "stop_price": stop_price,
-  }
-
-
-def parse_crypto_alliance(text: str):
-  if not text:
-    return None
-
-  header_match = re.search(
-      r"#?\s*([A-Za-z0-9_]+(?:\s*/\s*USDT|USDT)?)\s+(LONG|SHORT|ЛОНГ|ШОРТ)\b",
-      text,
-      re.IGNORECASE,
-  )
-  if not header_match:
-    return None
-
-  symbol = normalize_symbol(header_match.group(1))
-  raw_side = header_match.group(2).upper()
-  side = "LONG" if raw_side in ("LONG", "ЛОНГ") else "SHORT"
-  if not symbol:
-    return None
-
-  tps_match = re.search(
-      r"Тейки?\s*:\s*([^\n]+)",
-      text,
-      re.IGNORECASE,
-  )
-  if not tps_match:
-    return None
-
-  tp_prices = [
-      float(x.replace(",", "."))
-      for x in re.findall(r"[0-9]+(?:[.,][0-9]+)?", tps_match.group(1))
-  ]
-  if len(tp_prices) < 3:
-    return None
-
-  shares = [50.0, 25.0, 25.0]
-  tps = [
-      {"price": tp_prices[i], "share_pct": shares[i]}
-      for i in range(3)
-  ]
-
-  sl_match = re.search(
-      r"Стоп(?:-лосс)?\s*:\s*([0-9]+(?:[.,][0-9]+)?)",
-      text,
-      re.IGNORECASE,
-  )
-  stop_price = float(sl_match.group(1).replace(",", ".")) if sl_match else None
-  if stop_price is None:
-    return None
-
-  return {
-      "symbol": symbol,
-      "side": side,
-      "entry_price": None,
-      "tps": tps,
-      "stop_price": stop_price,
-  }
-
-
-def parse_roman_zlatov(text: str):
-  if not text:
-    return None
-
-  header_match = re.search(
-      r"#?\s*([A-Za-z0-9_]+(?:\s*/\s*USDT|USDT)?)\s+(LONG|SHORT|ЛОНГ|ШОРТ)\b",
-      text,
-      re.IGNORECASE,
-  )
-  if not header_match:
-    return None
-
-  symbol = normalize_symbol(header_match.group(1))
-  raw_side = header_match.group(2).upper()
-  side = "LONG" if raw_side in ("LONG", "ЛОНГ") else "SHORT"
-  if not symbol:
-    return None
-
-  tps_match = re.search(
-      r"Тейки?\s*:\s*([^\n]+)",
-      text,
-      re.IGNORECASE,
-  )
-  if not tps_match:
-    return None
-
-  tp_prices = [
-      float(x.replace(",", "."))
-      for x in re.findall(r"[0-9]+(?:[.,][0-9]+)?", tps_match.group(1))
-  ]
-  if len(tp_prices) < 3:
-    return None
-
-  shares = [50.0, 25.0, 25.0]
-  tps = [
-      {"price": tp_prices[i], "share_pct": shares[i]}
-      for i in range(3)
-  ]
-
-  sl_match = re.search(
-      r"Стоп(?:-лосс)?\s*:\s*([0-9]+(?:[.,][0-9]+)?)",
-      text,
-      re.IGNORECASE,
-  )
-  stop_price = float(sl_match.group(1).replace(",", ".")) if sl_match else None
-  if stop_price is None:
-    return None
-
-  return {
-      "symbol": symbol,
-      "side": side,
-      "entry_price": None,
-      "tps": tps,
-      "stop_price": stop_price,
-  }
-
-
-def parse_goat_trading(text: str):
-  if not text:
-    return None
-
-  header_match = re.search(
-      r"#?\s*([A-Za-z0-9_]+(?:\s*/\s*USDT|USDT)?)\s+(LONG|SHORT|ЛОНГ|ШОРТ)\b",
-      text,
-      re.IGNORECASE,
-  )
-  if not header_match:
-    return None
-
-  symbol = normalize_symbol(header_match.group(1))
-  raw_side = header_match.group(2).upper()
-  side = "LONG" if raw_side in ("LONG", "ЛОНГ") else "SHORT"
-  if not symbol:
-    return None
-
-  tp_match = re.search(
-      r"Цель\s*:\s*([0-9]+(?:[.,][0-9]+)?)",
-      text,
-      re.IGNORECASE,
-  )
-  if not tp_match:
-    return None
-  tp_price = float(tp_match.group(1).replace(",", "."))
-
-  sl_match = re.search(
-      r"Стоп(?:-лосс)?\s*:\s*([0-9]+(?:[.,][0-9]+)?)",
-      text,
-      re.IGNORECASE,
-  )
-  stop_price = float(sl_match.group(1).replace(",", ".")) if sl_match else None
-  if stop_price is None:
-    return None
-
-  return {
-      "symbol": symbol,
-      "side": side,
-      "entry_price": None,
-      "tps": [{"price": tp_price, "share_pct": 100.0}],
       "stop_price": stop_price,
   }
 
@@ -395,39 +340,45 @@ def to_telethon_channel_id(raw_id: int) -> int:
 CHANNEL_CONFIGS = {
     to_telethon_channel_id(3845170751): {
         "name": "Нестеров",
-        "parser": parse_nesterov,
+        "parser": parse_flexible_signal,
         "order_type": "limit",
-        "default_sl_pct": None,
+        "default_sl_pct": DEFAULT_STOP_LOSS_PCT,
+        "tp_shares": None,
     },
     to_telethon_channel_id(2254922481): {
         "name": "Роман Робертович",
-        "parser": parse_roman_robertovich,
+        "parser": parse_flexible_signal,
         "order_type": "market",
-        "default_sl_pct": None,
+        "default_sl_pct": DEFAULT_STOP_LOSS_PCT,
+        "tp_shares": [100.0],
     },
     to_telethon_channel_id(1574940403): {
         "name": "AltCentr",
-        "parser": parse_altcentr,
+        "parser": parse_flexible_signal,
         "order_type": "limit",
-        "default_sl_pct": None,
+        "default_sl_pct": DEFAULT_STOP_LOSS_PCT,
+        "tp_shares": [50.0, 25.0, 25.0],
     },
     to_telethon_channel_id(1195973120): {
         "name": "Crypto Alliance (Мартин)",
-        "parser": parse_crypto_alliance,
+        "parser": parse_flexible_signal,
         "order_type": "market",
-        "default_sl_pct": None,
+        "default_sl_pct": DEFAULT_STOP_LOSS_PCT,
+        "tp_shares": [50.0, 25.0, 25.0],
     },
     to_telethon_channel_id(1698940666): {
         "name": "Роман Златов",
-        "parser": parse_roman_zlatov,
+        "parser": parse_flexible_signal,
         "order_type": "market",
-        "default_sl_pct": None,
+        "default_sl_pct": DEFAULT_STOP_LOSS_PCT,
+        "tp_shares": [50.0, 25.0, 25.0],
     },
     to_telethon_channel_id(2224581920): {
         "name": "GOAT TRADING",
-        "parser": parse_goat_trading,
+        "parser": parse_flexible_signal,
         "order_type": "market",
-        "default_sl_pct": None,
+        "default_sl_pct": DEFAULT_STOP_LOSS_PCT,
+        "tp_shares": [100.0],
     },
 }
 
@@ -848,19 +799,16 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
           "algoId": algo_id,
       })
 
-  # 3. Стоп-лосс (SL): из сигнала или расчётный от default_sl_pct
+  # 3. Стоп-лосс (SL): из сигнала или расчётный от default_sl_pct (по умолчанию 10%)
   raw_stop = sig.get("stop_price")
-  if raw_stop is None and sig.get("default_sl_pct"):
-    sl_mult = (
-        (1.0 - float(sig["default_sl_pct"]) / 100.0)
-        if is_long
-        else (1.0 + float(sig["default_sl_pct"]) / 100.0)
-    )
+  if raw_stop is None:
+    sl_pct = float(sig.get("default_sl_pct") or DEFAULT_STOP_LOSS_PCT)
+    sl_mult = (1.0 - sl_pct / 100.0) if is_long else (1.0 + sl_pct / 100.0)
     raw_stop = float(actual_entry_px_dec) * sl_mult
 
   sl_px_str = "—"
   sl_algo_id = "—"
-  if raw_stop is not None:
+  if raw_stop is not None and raw_stop > 0:
     sl_px_dec = round_step(raw_stop, spec["tickSz"], ROUND_HALF_UP)
     sl_algo_id = place_stop_loss_algo(
         inst_id=inst_id,
@@ -1047,8 +995,10 @@ def format_signal_card(sig: dict) -> str:
     entry_label = (
         f"лимит `{candidates[0]}` (или `{candidates[1]}` при пробое по рынку)"
     )
-  else:
+  elif sig.get("entry_price") is not None:
     entry_label = f"`{sig['entry_price']}` (лимит)"
+  else:
+    entry_label = "По рынку (MARKET)"
 
   tps = sig.get("tps") or []
   if len(tps) == 1:
@@ -1063,10 +1013,9 @@ def format_signal_card(sig: dict) -> str:
 
   if sig.get("stop_price") is not None:
     sl_label = f"`{sig['stop_price']}`"
-  elif sig.get("default_sl_pct"):
-    sl_label = f"авто `{sig['default_sl_pct']}%` от входа"
   else:
-    sl_label = "не задан"
+    sl_pct = sig.get("default_sl_pct") or DEFAULT_STOP_LOSS_PCT
+    sl_label = f"авто `{sl_pct}%` от входа"
 
   emoji = "🟢" if sig["side"] == "LONG" else "🔴"
   return (
@@ -1179,14 +1128,27 @@ async def on_channel_post(event):
     return
 
   raw_text = event.raw_text or ""
-  sig = cfg["parser"](raw_text)
+  parser_fn = cfg.get("parser") or parse_flexible_signal
+  try:
+    sig = parser_fn(raw_text, cfg)
+  except TypeError:
+    sig = parser_fn(raw_text)
+
   if not sig:
+    if raw_text.strip():
+      preview = raw_text.strip().replace("\n", " | ")[:220]
+      print(
+          f"ℹ️ Пост в [{cfg['name']}] не распознан как сигнал: {preview}",
+          flush=True,
+      )
     return
 
   sig["source_id"] = event.chat_id
   sig["source_name"] = cfg["name"]
-  sig["order_type"] = cfg.get("order_type", "limit")
-  sig["default_sl_pct"] = cfg.get("default_sl_pct")
+  sig["order_type"] = (
+      "market" if sig.get("entry_price") is None else cfg.get("order_type", "limit")
+  )
+  sig["default_sl_pct"] = cfg.get("default_sl_pct", DEFAULT_STOP_LOSS_PCT)
 
   print(f"📩 Спарсен сигнал [{cfg['name']}]: {sig}", flush=True)
   pending_signals[TARGET_CHAT_ID] = sig
