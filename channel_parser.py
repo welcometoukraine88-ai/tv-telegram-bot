@@ -141,6 +141,82 @@ def parse_roman_robertovich(text: str):
   }
 
 
+def parse_cryptolab(text: str):
+  if not text:
+    return None
+
+  header_match = re.search(
+      r"(?:^|\n)\s*(?:захожу\s+в\s+)?\$?\s*([A-Za-z0-9_]+(?:/?USDT)?)\s+(LONG|SHORT|ЛОНГ|ШОРТ)\b",
+      text,
+      re.IGNORECASE,
+  )
+  if not header_match:
+    return None
+
+  symbol = normalize_symbol(header_match.group(1))
+  raw_side = header_match.group(2).upper()
+  side = "LONG" if raw_side in ("LONG", "ЛОНГ") else "SHORT"
+  if not symbol:
+    return None
+
+  entry_match = re.search(
+      r"Вход\s*:\s*([^\n]+)",
+      text,
+      re.IGNORECASE,
+  )
+  if not entry_match:
+    return None
+
+  entry_nums = [
+      float(x.replace(",", "."))
+      for x in re.findall(r"[0-9]+(?:[.,][0-9]+)?", entry_match.group(1))
+  ]
+  if not entry_nums:
+    return None
+
+  entry_1 = entry_nums[0]
+  entry_2 = entry_nums[1] if len(entry_nums) > 1 else None
+
+  targets_match = re.search(
+      r"Цели?\s*:\s*([^\n]+)",
+      text,
+      re.IGNORECASE,
+  )
+  if not targets_match:
+    return None
+
+  target_prices = [
+      float(x.replace(",", "."))
+      for x in re.findall(r"[0-9]+(?:[.,][0-9]+)?", targets_match.group(1))
+  ]
+  if len(target_prices) < 3:
+    return None
+
+  shares = [50.0, 25.0, 25.0]
+  tps = [
+      {"price": target_prices[i], "share_pct": shares[i]}
+      for i in range(3)
+  ]
+
+  sl_match = re.search(
+      r"Стоп(?:-лосс)?\s*:\s*([0-9]+(?:[.,][0-9]+)?)",
+      text,
+      re.IGNORECASE,
+  )
+  stop_price = float(sl_match.group(1).replace(",", ".")) if sl_match else None
+  if stop_price is None:
+    return None
+
+  return {
+      "symbol": symbol,
+      "side": side,
+      "entry_price": entry_1,
+      "entry_candidates": [entry_1, entry_2] if entry_2 is not None else [entry_1],
+      "tps": tps,
+      "stop_price": stop_price,
+  }
+
+
 def to_telethon_channel_id(raw_id: int) -> int:
   if raw_id < 0:
     return raw_id
@@ -165,6 +241,12 @@ CHANNEL_CONFIGS = {
         "name": "Роман Робертович",
         "parser": parse_roman_robertovich,
         "order_type": "market",
+        "default_sl_pct": None,
+    },
+    to_telethon_channel_id(1656286512): {
+        "name": "CRYPTOLAB",
+        "parser": parse_cryptolab,
+        "order_type": "limit",
         "default_sl_pct": None,
     },
 }
@@ -339,6 +421,21 @@ def set_cross_leverage(inst_id: str, lever: str, pos_mode: str, side: str):
   return okx_request("POST", "/api/v5/account/set-leverage", data=payload)
 
 
+def resolve_limit_entry_price(sig: dict, inst_id: str) -> float:
+  candidates = sig.get("entry_candidates") or []
+  if len(candidates) >= 2:
+    entry_1, entry_2 = float(candidates[0]), float(candidates[1])
+    mkt_px = get_market_price(inst_id)
+    if sig["side"] == "LONG" and mkt_px < entry_1:
+      return entry_2
+    if sig["side"] == "SHORT" and mkt_px > entry_1:
+      return entry_2
+    return entry_1
+  if candidates:
+    return float(candidates[0])
+  return float(sig["entry_price"])
+
+
 def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
   inst_id = symbol_to_inst_id(sig["symbol"])
   side = sig["side"]
@@ -360,7 +457,8 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
     ref_price = get_market_price(inst_id)
     entry_px_dec = round_step(ref_price, spec["tickSz"], ROUND_HALF_UP)
   else:
-    entry_px_dec = round_step(sig["entry_price"], spec["tickSz"], ROUND_HALF_UP)
+    chosen_entry = resolve_limit_entry_price(sig, inst_id)
+    entry_px_dec = round_step(chosen_entry, spec["tickSz"], ROUND_HALF_UP)
 
   ct_val_dec = Decimal(str(spec["ctVal"]))
   min_sz_dec = Decimal(str(spec["minSz"]))
@@ -498,11 +596,16 @@ def execute_okx_signal(sig: dict, margin_usdt: float) -> dict:
 def format_signal_card(sig: dict) -> str:
   source_name = sig.get("source_name", "Неизвестный канал")
   order_type = sig.get("order_type", "limit")
-  entry_label = (
-      "По рынку (MARKET)"
-      if order_type == "market"
-      else f"`{sig['entry_price']}` (лимит)"
-  )
+  candidates = sig.get("entry_candidates") or []
+
+  if order_type == "market":
+    entry_label = "По рынку (MARKET)"
+  elif len(candidates) >= 2:
+    entry_label = (
+        f"лимит `{candidates[0]}` (или `{candidates[1]}` при пробое по рынку)"
+    )
+  else:
+    entry_label = f"`{sig['entry_price']}` (лимит)"
 
   tps = sig.get("tps") or []
   if len(tps) == 1:
