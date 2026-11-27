@@ -12,7 +12,7 @@ services:
       - key: OKX_PASSPHRASE
         sync: false
       - key: MARGIN_USDT
-        value: "50"
+        value: "1"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID
