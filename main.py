@@ -409,80 +409,84 @@ async def webhook(request: Request):
 
     raw_bytes = await request.body()
     raw_text = raw_bytes.decode("utf-8", errors="replace").strip()
+    print(f"[WEBHOOK RAW] {raw_text!r}")
 
     try:
         sig = parse_signal_payload(raw_text)
         margin = get_margin_usdt()
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        inst_id = normalize_inst_id(sig["coin"])
 
-    inst_id = normalize_inst_id(sig["coin"])
+        async with httpx.AsyncClient() as client:
+            inst = await get_instrument_info(client, inst_id)
+            price = await get_last_price(client, inst_id)
 
-    async with httpx.AsyncClient() as client:
-        inst = await get_instrument_info(client, inst_id)
-        price = await get_last_price(client, inst_id)
+            max_lev = int(float(inst.get("lever", "20")))
+            applied_lev = await set_max_cross_leverage(client, inst_id, max_lev)
 
-        max_lev = int(float(inst.get("lever", "20")))
-        applied_lev = await set_max_cross_leverage(client, inst_id, max_lev)
+            ct_val = float(inst.get("ctVal", "1"))
+            lot_sz = float(inst.get("lotSz", "1"))
+            min_sz = float(inst.get("minSz", str(lot_sz)))
+            tick_sz = inst.get("tickSz", "0.01")
 
-        ct_val = float(inst.get("ctVal", "1"))
-        lot_sz = float(inst.get("lotSz", "1"))
-        min_sz = float(inst.get("minSz", str(lot_sz)))
-        tick_sz = inst.get("tickSz", "0.01")
+            lot_decimals = decimals_from_step(str(lot_sz))
+            notional_usdt = margin * applied_lev
+            raw_contracts = notional_usdt / (price * ct_val)
+            contracts = round_step_down(raw_contracts, lot_sz, lot_decimals)
 
-        lot_decimals = decimals_from_step(str(lot_sz))
-        notional_usdt = margin * applied_lev
-        raw_contracts = notional_usdt / (price * ct_val)
-        contracts = round_step_down(raw_contracts, lot_sz, lot_decimals)
+            if contracts < min_sz:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Size {contracts} < minSz {min_sz} for {inst_id}",
+                )
 
-        if contracts < min_sz:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Size {contracts} < minSz {min_sz} for {inst_id}",
+            sz_str = f"{contracts:.{lot_decimals}f}" if lot_decimals > 0 else str(int(contracts))
+            tp_str = format_by_tick(sig["tp"], tick_sz)
+            sl_str = format_by_tick(sig["sl"], tick_sz)
+
+            order_res = await place_cross_order_with_tpsl(
+                client=client,
+                inst_id=inst_id,
+                side=sig["side"],
+                sz_str=sz_str,
+                tp_str=tp_str,
+                sl_str=sl_str,
             )
 
-        sz_str = f"{contracts:.{lot_decimals}f}" if lot_decimals > 0 else str(int(contracts))
-        tp_str = format_by_tick(sig["tp"], tick_sz)
-        sl_str = format_by_tick(sig["sl"], tick_sz)
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            async with state_lock:
+                tracked_positions[inst_id] = {
+                    "side": sig["side"],
+                    "tp": float(tp_str),
+                    "sl": float(sl_str),
+                    "entry_px": price,
+                    "margin_usdt": margin,
+                    "leverage": applied_lev,
+                    "opened_at_ms": now_ms,
+                }
 
-        order_res = await place_cross_order_with_tpsl(
-            client=client,
-            inst_id=inst_id,
-            side=sig["side"],
-            sz_str=sz_str,
-            tp_str=tp_str,
-            sl_str=sl_str,
-        )
+            open_msg = (
+                f"Открыта позиция\n"
+                f"Монета: {inst_id}\n"
+                f"Направление: {sig['side']}\n"
+                f"Маржа: {margin:.2f} USDT | Плечо: {applied_lev}x\n"
+                f"TP: {tp_str} | SL: {sl_str}"
+            )
+            await send_tg_message(client, open_msg)
 
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        async with state_lock:
-            tracked_positions[inst_id] = {
-                "side": sig["side"],
-                "tp": float(tp_str),
-                "sl": float(sl_str),
-                "entry_px": price,
-                "margin_usdt": margin,
-                "leverage": applied_lev,
-                "opened_at_ms": now_ms,
-            }
-
-        open_msg = (
-            f"Открыта позиция\n"
-            f"Монета: {inst_id}\n"
-            f"Направление: {sig['side']}\n"
-            f"Маржа: {margin:.2f} USDT | Плечо: {applied_lev}x\n"
-            f"TP: {tp_str} | SL: {sl_str}"
-        )
-        await send_tg_message(client, open_msg)
-
-    return {
-        "status": "ok",
-        "instId": inst_id,
-        "side": sig["side"],
-        "margin_usdt": margin,
-        "leverage": applied_lev,
-        "contracts": sz_str,
-        "tp": tp_str,
-        "sl": sl_str,
-        "okx": order_res,
-    }
+        return {
+            "status": "ok",
+            "instId": inst_id,
+            "side": sig["side"],
+            "margin_usdt": margin,
+            "leverage": applied_lev,
+            "contracts": sz_str,
+            "tp": tp_str,
+            "sl": sl_str,
+            "okx": order_res,
+        }
+    except HTTPException as exc:
+        print(f"[WEBHOOK ERROR] {exc.status_code} {exc.detail}")
+        raise
+    except Exception as exc:
+        print(f"[WEBHOOK ERROR] {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=400, detail=str(exc))
