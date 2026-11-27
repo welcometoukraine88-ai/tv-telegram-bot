@@ -77,38 +77,55 @@ def normalize_inst_id(raw_coin: str) -> str:
 
 
 def parse_signal_payload(raw_text: str) -> dict:
-    text = raw_text.strip().strip('"').strip("'").strip()
-    if text.startswith("{"):
+    cleaned = raw_text.strip().strip('"').strip("'").strip()
+    cleaned_flat = re.sub(r"[\r\n]+", " ", cleaned).strip()
+
+    parts = [p.strip() for p in cleaned_flat.split("|") if p.strip()]
+    kv: dict[str, str] = {}
+    for part in parts:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            kv[k.strip().upper()] = v.strip().strip('"').strip("'")
+        elif ":" in part:
+            k, v = part.split(":", 1)
+            kv[k.strip().upper()] = v.strip().strip('"').strip("'")
+
+    coin = kv.get("COIN") or kv.get("SYMBOL") or kv.get("TICKER")
+    side_raw = (kv.get("SIDE") or kv.get("DIRECTION") or "").upper()
+    tp_raw = kv.get("TP")
+    sl_raw = kv.get("SL")
+
+    if not (coin and side_raw and tp_raw and sl_raw) and cleaned.startswith("{"):
         try:
-            data = json.loads(text)
+            data = json.loads(cleaned)
             coin = str(data.get("coin") or data.get("symbol") or data.get("ticker") or "").strip()
             side_raw = str(data.get("side") or data.get("direction") or "").strip().upper()
-            tp = float(data["tp"])
-            sl = float(data["sl"])
-            if coin and side_raw in ("LONG", "SHORT", "BUY", "SELL"):
-                side = "LONG" if side_raw in ("LONG", "BUY") else "SHORT"
-                return {"coin": coin, "side": side, "tp": tp, "sl": sl}
+            tp_raw = str(data.get("tp", ""))
+            sl_raw = str(data.get("sl", ""))
         except Exception:
             pass
 
-    cleaned = re.sub(r"\s+", " ", text)
+    if side_raw in ("LONG", "BUY"):
+        side = "LONG"
+    elif side_raw in ("SHORT", "SELL"):
+        side = "SHORT"
+    else:
+        raise ValueError(f"Invalid or missing SIDE in payload: {raw_text!r}")
 
-    coin_match = re.search(r"Coin\s*:\s*([A-Za-z0-9._-]+)", cleaned, re.IGNORECASE)
-    side_match = re.search(r"Side\s*:\s*(LONG|SHORT|BUY|SELL)", cleaned, re.IGNORECASE)
-    tp_match = re.search(r"TP\s*:\s*([0-9]+(?:\.[0-9]+)?)", cleaned, re.IGNORECASE)
-    sl_match = re.search(r"SL\s*:\s*([0-9]+(?:\.[0-9]+)?)", cleaned, re.IGNORECASE)
+    if not coin:
+        raise ValueError(f"Missing COIN in payload: {raw_text!r}")
 
-    if not (coin_match and side_match and tp_match and sl_match):
-        raise ValueError(f"Cannot parse signal: {raw_text}")
-
-    side_raw = side_match.group(1).upper()
-    side = "LONG" if side_raw in ("LONG", "BUY") else "SHORT"
+    try:
+        tp_val = float(re.sub(r"[^0-9.]", "", str(tp_raw)))
+        sl_val = float(re.sub(r"[^0-9.]", "", str(sl_raw)))
+    except Exception as exc:
+        raise ValueError(f"Invalid TP/SL in payload: {raw_text!r}") from exc
 
     return {
-        "coin": coin_match.group(1).strip(),
+        "coin": coin,
         "side": side,
-        "tp": float(tp_match.group(1)),
-        "sl": float(sl_match.group(1)),
+        "tp": tp_val,
+        "sl": sl_val,
     }
 
 
