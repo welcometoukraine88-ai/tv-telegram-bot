@@ -77,7 +77,7 @@ def normalize_inst_id(raw_coin: str) -> str:
 
 
 def parse_signal_payload(raw_text: str) -> dict:
-    text = raw_text.strip()
+    text = raw_text.strip().strip('"').strip("'").strip()
     if text.startswith("{"):
         try:
             data = json.loads(text)
@@ -91,13 +91,15 @@ def parse_signal_payload(raw_text: str) -> dict:
         except Exception:
             pass
 
-    coin_match = re.search(r"Coin\s*:\s*([A-Za-z0-9._-]+)", text, re.IGNORECASE)
-    side_match = re.search(r"Side\s*:\s*(LONG|SHORT|BUY|SELL)", text, re.IGNORECASE)
-    tp_match = re.search(r"TP\s*:\s*([0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
-    sl_match = re.search(r"SL\s*:\s*([0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", text)
+
+    coin_match = re.search(r"Coin\s*:\s*([A-Za-z0-9._-]+)", cleaned, re.IGNORECASE)
+    side_match = re.search(r"Side\s*:\s*(LONG|SHORT|BUY|SELL)", cleaned, re.IGNORECASE)
+    tp_match = re.search(r"TP\s*:\s*([0-9]+(?:\.[0-9]+)?)", cleaned, re.IGNORECASE)
+    sl_match = re.search(r"SL\s*:\s*([0-9]+(?:\.[0-9]+)?)", cleaned, re.IGNORECASE)
 
     if not (coin_match and side_match and tp_match and sl_match):
-        raise ValueError(f"Cannot parse signal: {text}")
+        raise ValueError(f"Cannot parse signal: {raw_text}")
 
     side_raw = side_match.group(1).upper()
     side = "LONG" if side_raw in ("LONG", "BUY") else "SHORT"
