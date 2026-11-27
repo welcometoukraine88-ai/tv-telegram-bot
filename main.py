@@ -24,8 +24,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 POLL_INTERVAL_SECONDS = 300  # каждые 5 минут
 
-# Состояние активных позиций, открытых через вебхук:
-# inst_id -> {side, tp, sl, entry_px, margin_usdt, leverage, opened_at_ms}
 tracked_positions: dict[str, dict] = {}
 state_lock = asyncio.Lock()
 
@@ -139,12 +137,8 @@ async def send_tg_message(client: httpx.AsyncClient, text: str) -> None:
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-    }
     try:
-        r = await client.post(url, json=payload, timeout=10.0)
+        r = await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10.0)
         if r.status_code >= 400:
             print(f"[TG ERROR] {r.status_code} {r.text}")
     except Exception as exc:
@@ -307,4 +301,169 @@ def classify_exit_and_metrics(pos_meta: dict, closed_rec: Optional[dict], fallba
     if side == "LONG":
         price_move_pct = ((exit_px - entry_px) / entry_px) * 100.0 if entry_px > 0 else 0.0
     else:
-        price_move_pct = ((entry_px - exit_px) / entry_px) * 100.0 if entry_px > 0 else
+        price_move_pct = ((entry_px - exit_px) / entry_px) * 100.0 if entry_px > 0 else 0.0
+
+    dist_tp = abs(exit_px - tp_px)
+    dist_sl = abs(exit_px - sl_px)
+    tol = max(abs(tp_px - sl_px) * 0.15, entry_px * 0.001)
+
+    if dist_tp <= tol and dist_tp < dist_sl:
+        outcome = "TP"
+    elif dist_sl <= tol and dist_sl < dist_tp:
+        outcome = "SL"
+    else:
+        outcome = "TP" if price_move_pct >= 0 else "SL"
+
+    return outcome, price_move_pct, realized_pnl
+
+
+async def monitor_positions_loop() -> None:
+    while True:
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        if not (OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE):
+            continue
+
+        try:
+            async with state_lock:
+                if not tracked_positions:
+                    continue
+                snapshot = dict(tracked_positions)
+
+            async with httpx.AsyncClient() as client:
+                open_positions = await fetch_open_swap_positions(client)
+
+                for inst_id, meta in snapshot.items():
+                    if inst_id in open_positions:
+                        continue
+
+                    try:
+                        last_px = await get_last_price(client, inst_id)
+                    except Exception:
+                        last_px = meta["entry_px"]
+
+                    closed_rec = await fetch_closed_position_record(
+                        client=client,
+                        inst_id=inst_id,
+                        opened_at_ms=meta["opened_at_ms"],
+                    )
+                    outcome, move_pct, pnl_usdt = classify_exit_and_metrics(meta, closed_rec, last_px)
+
+                    async with state_lock:
+                        tracked_positions.pop(inst_id, None)
+
+                    sign_move = "+" if move_pct >= 0 else ""
+                    sign_pnl = "+" if pnl_usdt >= 0 else ""
+                    msg = (
+                        f"Закрытие позиции\n"
+                        f"Монета: {inst_id}\n"
+                        f"Направление: {meta['side']}\n"
+                        f"Результат: {outcome}\n"
+                        f"Движение цены: {sign_move}{move_pct:.2f}%\n"
+                        f"PnL: {sign_pnl}{pnl_usdt:.4f} USDT"
+                    )
+                    await send_tg_message(client, msg)
+
+        except Exception as exc:
+            print(f"[MONITOR ERROR] {exc}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(monitor_positions_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="OKX Cross Webhook + TG Tracker", lifespan=lifespan)
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    if not (OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE):
+        raise HTTPException(status_code=500, detail="OKX credentials are not configured")
+
+    raw_bytes = await request.body()
+    raw_text = raw_bytes.decode("utf-8", errors="replace").strip()
+
+    try:
+        sig = parse_signal_payload(raw_text)
+        margin = get_margin_usdt()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    inst_id = normalize_inst_id(sig["coin"])
+
+    async with httpx.AsyncClient() as client:
+        inst = await get_instrument_info(client, inst_id)
+        price = await get_last_price(client, inst_id)
+
+        max_lev = int(float(inst.get("lever", "20")))
+        applied_lev = await set_max_cross_leverage(client, inst_id, max_lev)
+
+        ct_val = float(inst.get("ctVal", "1"))
+        lot_sz = float(inst.get("lotSz", "1"))
+        min_sz = float(inst.get("minSz", str(lot_sz)))
+        tick_sz = inst.get("tickSz", "0.01")
+
+        lot_decimals = decimals_from_step(str(lot_sz))
+        notional_usdt = margin * applied_lev
+        raw_contracts = notional_usdt / (price * ct_val)
+        contracts = round_step_down(raw_contracts, lot_sz, lot_decimals)
+
+        if contracts < min_sz:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Size {contracts} < minSz {min_sz} for {inst_id}",
+            )
+
+        sz_str = f"{contracts:.{lot_decimals}f}" if lot_decimals > 0 else str(int(contracts))
+        tp_str = format_by_tick(sig["tp"], tick_sz)
+        sl_str = format_by_tick(sig["sl"], tick_sz)
+
+        order_res = await place_cross_order_with_tpsl(
+            client=client,
+            inst_id=inst_id,
+            side=sig["side"],
+            sz_str=sz_str,
+            tp_str=tp_str,
+            sl_str=sl_str,
+        )
+
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        async with state_lock:
+            tracked_positions[inst_id] = {
+                "side": sig["side"],
+                "tp": float(tp_str),
+                "sl": float(sl_str),
+                "entry_px": price,
+                "margin_usdt": margin,
+                "leverage": applied_lev,
+                "opened_at_ms": now_ms,
+            }
+
+        open_msg = (
+            f"Открыта позиция\n"
+            f"Монета: {inst_id}\n"
+            f"Направление: {sig['side']}\n"
+            f"Маржа: {margin:.2f} USDT | Плечо: {applied_lev}x\n"
+            f"TP: {tp_str} | SL: {sl_str}"
+        )
+        await send_tg_message(client, open_msg)
+
+    return {
+        "status": "ok",
+        "instId": inst_id,
+        "side": sig["side"],
+        "margin_usdt": margin,
+        "leverage": applied_lev,
+        "contracts": sz_str,
+        "tp": tp_str,
+        "sl": sl_str,
+        "okx": order_res,
+    }
