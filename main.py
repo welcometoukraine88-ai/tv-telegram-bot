@@ -31,7 +31,7 @@ state_lock = asyncio.Lock()
 
 
 def get_margin_usdt() -> float:
-    val = float(os.getenv("MARGIN_USDT", "50"))
+    val = float(os.getenv("MARGIN_USDT", "1"))
     if val <= 0:
         raise ValueError("MARGIN_USDT must be > 0")
     return val
