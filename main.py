@@ -220,6 +220,7 @@ async def place_cross_order_with_tpsl(
         "instId": inst_id,
         "tdMode": "cross",
         "side": "buy" if side == "LONG" else "sell",
+        "posSide": "long" if side == "LONG" else "short",
         "ordType": "market",
         "sz": sz_str,
         "attachAlgoOrds": [
@@ -245,7 +246,6 @@ async def place_cross_order_with_tpsl(
     if res.get("code") != "0":
         raise HTTPException(status_code=400, detail=f"Order failed: {res}")
     return res
-
 
 async def fetch_open_swap_positions(client: httpx.AsyncClient) -> dict[str, dict]:
     req_path = "/api/v5/account/positions?instType=SWAP"
