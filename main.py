@@ -6,11 +6,14 @@ import math
 import os
 import re
 from datetime import datetime, timezone
+from typing import Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 
 OKX_BASE_URL = "https://www.okx.com"
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 OKX_API_KEY = os.getenv("OKX_API_KEY", "").strip()
 OKX_SECRET_KEY = os.getenv("OKX_SECRET_KEY", "").strip()
@@ -18,6 +21,9 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "").strip()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+last_daily_report_kyiv_date: Optional[str] = None
+recent_bot_entries_ms: list[int] = []
 
 
 def get_margin_usdt() -> float:
@@ -240,6 +246,157 @@ async def place_cross_order_with_tpsl(
     return res
 
 
+def _safe_float(val: object, default: float = 0.0) -> float:
+    if val in (None, ""):
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def _classify_closed_position_outcome(item: dict) -> str:
+    # На OKX в positions-history есть поля по ценам/PnL; если явного тега нет,
+    # смотрим знак реализованного PnL и движение средней цены позиции
+    realized = _safe_float(item.get("realizedPnl"), _safe_float(item.get("pnl"), 0.0))
+    open_avg = _safe_float(item.get("openAvgPx"), 0.0)
+    close_avg = _safe_float(item.get("closeAvgPx"), _safe_float(item.get("avgPx"), 0.0))
+    pos_side = str(item.get("posSide") or item.get("direction") or "").lower()
+
+    if open_avg > 0 and close_avg > 0:
+        if pos_side == "long":
+            return "TP" if close_avg >= open_avg else "SL"
+        if pos_side == "short":
+            return "TP" if close_avg <= open_avg else "SL"
+
+    if realized > 0:
+        return "TP"
+    if realized < 0:
+        return "SL"
+    return "OTHER"
+
+
+async def _fetch_positions_history_24h(client: httpx.AsyncClient, cutoff_ms: int) -> list[dict]:
+    req_path = "/api/v5/account/positions-history?instType=SWAP&limit=100"
+    r = await client.get(
+        f"{OKX_BASE_URL}{req_path}",
+        headers=okx_headers("GET", req_path, ""),
+        timeout=10.0,
+    )
+    r.raise_for_status()
+    res = r.json()
+    if res.get("code") != "0":
+        raise RuntimeError(f"positions-history error: {res}")
+    return [row for row in res.get("data", []) if int(_safe_float(row.get("uTime"), 0)) >= cutoff_ms]
+
+
+async def _fetch_open_positions_24h(client: httpx.AsyncClient, cutoff_ms: int) -> list[dict]:
+    req_path = "/api/v5/account/positions?instType=SWAP"
+    r = await client.get(
+        f"{OKX_BASE_URL}{req_path}",
+        headers=okx_headers("GET", req_path, ""),
+        timeout=10.0,
+    )
+    r.raise_for_status()
+    res = r.json()
+    if res.get("code") != "0":
+        raise RuntimeError(f"positions error: {res}")
+    opened = []
+    for row in res.get("data", []):
+        pos_sz = abs(_safe_float(row.get("pos"), 0.0))
+        c_time = int(_safe_float(row.get("cTime"), 0))
+        if pos_sz > 0 and c_time >= cutoff_ms:
+            opened.append(row)
+    return opened
+
+
+async def _fetch_bills_pnl_24h(client: httpx.AsyncClient, cutoff_ms: int) -> Optional[float]:
+    req_path = "/api/v5/account/bills?instType=SWAP&limit=100"
+    r = await client.get(
+        f"{OKX_BASE_URL}{req_path}",
+        headers=okx_headers("GET", req_path, ""),
+        timeout=10.0,
+    )
+    r.raise_for_status()
+    res = r.json()
+    if res.get("code") != "0":
+        return None
+
+    total = 0.0
+    matched = False
+    for row in res.get("data", []):
+        ts_ms = int(_safe_float(row.get("ts"), 0))
+        if ts_ms < cutoff_ms:
+            continue
+        # В bills OKX для SWAP учитываются pnl, fee (обычно отрицательное число) и фандинг
+        pnl_val = _safe_float(row.get("pnl"), 0.0)
+        fee_val = _safe_float(row.get("fee"), 0.0)
+        total += pnl_val + fee_val
+        matched = True
+
+    return total if matched else 0.0
+
+
+async def maybe_send_daily_report_kyiv(client: httpx.AsyncClient) -> None:
+    global last_daily_report_kyiv_date, recent_bot_entries_ms
+
+    now_kyiv = datetime.now(KYIV_TZ)
+    # Окно с 22:00 до 23:00 по Киеву (включительно 22:00..22:59)
+    if now_kyiv.hour != 22:
+        return
+
+    today_str = now_kyiv.strftime("%Y-%m-%d")
+    if last_daily_report_kyiv_date == today_str:
+        return
+
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    cutoff_ms = now_ms - 24 * 60 * 60 * 1000
+    recent_bot_entries_ms = [ts for ts in recent_bot_entries_ms if ts >= cutoff_ms]
+
+    closed_rows = await _fetch_positions_history_24h(client, cutoff_ms)
+    open_now_24h = await _fetch_open_positions_24h(client, cutoff_ms)
+
+    opened_from_closed_24h = sum(
+        1 for row in closed_rows if int(_safe_float(row.get("cTime"), 0)) >= cutoff_ms
+    )
+    opened_count = max(
+        len(recent_bot_entries_ms),
+        len(open_now_24h) + opened_from_closed_24h,
+    )
+
+    tp_count = 0
+    sl_count = 0
+    other_count = 0
+    closed_realized_sum = 0.0
+
+    for row in closed_rows:
+        outcome = _classify_closed_position_outcome(row)
+        if outcome == "TP":
+            tp_count += 1
+        elif outcome == "SL":
+            sl_count += 1
+        else:
+            other_count += 1
+        closed_realized_sum += _safe_float(row.get("realizedPnl"), _safe_float(row.get("pnl"), 0.0))
+
+    bills_pnl = await _fetch_bills_pnl_24h(client, cutoff_ms)
+    total_pnl = bills_pnl if bills_pnl is not None else closed_realized_sum
+
+    sign_pnl = "+" if total_pnl >= 0 else ""
+    lines = [
+        f"📊 Отчёт за 24ч ({today_str}, Киев)",
+        f"Открыто позиций: {opened_count}",
+        f"Закрыто позиций: {len(closed_rows)}",
+        f"TP: {tp_count} | SL: {sl_count}",
+    ]
+    if other_count > 0:
+        lines.append(f"Прочие закрытия: {other_count}")
+    lines.append(f"Итоговый PnL (с комиссиями и фандингом): {sign_pnl}{total_pnl:.4f} USDT")
+
+    await send_tg_message(client, "\n".join(lines))
+    last_daily_report_kyiv_date = today_str
+
+
 app = FastAPI(title="OKX Cross Webhook")
 
 
@@ -294,6 +451,8 @@ async def webhook(request: Request):
                 sl_str=sl_str,
             )
 
+            recent_bot_entries_ms.append(int(datetime.now(timezone.utc).timestamp() * 1000))
+
             dot = "🟢" if sig["side"] == "LONG" else "🔴"
             open_msg = (
                 f"{dot} Вход: {sig['side']}\n"
@@ -302,6 +461,11 @@ async def webhook(request: Request):
                 f"Вход: {entry_str} | TP: {tp_str} | SL: {sl_str}"
             )
             await send_tg_message(client, open_msg)
+
+            try:
+                await maybe_send_daily_report_kyiv(client)
+            except Exception as rep_exc:
+                print(f"[DAILY REPORT ERROR] {type(rep_exc).__name__}: {rep_exc}")
 
         return {
             "status": "ok",
