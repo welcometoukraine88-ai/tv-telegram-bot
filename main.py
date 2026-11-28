@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import hashlib
 import hmac
@@ -6,9 +5,7 @@ import json
 import math
 import os
 import re
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -21,11 +18,6 @@ OKX_PASSPHRASE = os.getenv("OKX_PASSPHRASE", "").strip()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-POLL_INTERVAL_SECONDS = 300  # каждые 5 минут
-
-tracked_positions: dict[str, dict] = {}
-state_lock = asyncio.Lock()
 
 
 def get_margin_usdt() -> float:
@@ -248,159 +240,7 @@ async def place_cross_order_with_tpsl(
     return res
 
 
-async def fetch_open_swap_positions(client: httpx.AsyncClient) -> dict[str, dict]:
-    req_path = "/api/v5/account/positions?instType=SWAP"
-    r = await client.get(
-        f"{OKX_BASE_URL}{req_path}",
-        headers=okx_headers("GET", req_path, ""),
-        timeout=10.0,
-    )
-    r.raise_for_status()
-    res = r.json()
-    if res.get("code") != "0":
-        raise RuntimeError(f"positions error: {res}")
-
-    open_map: dict[str, dict] = {}
-    for pos in res.get("data", []):
-        pos_sz = abs(float(pos.get("pos", "0") or "0"))
-        if pos_sz > 0:
-            open_map[pos["instId"]] = pos
-    return open_map
-
-
-async def fetch_closed_position_record(
-    client: httpx.AsyncClient,
-    inst_id: str,
-    opened_at_ms: int,
-) -> Optional[dict]:
-    req_path = f"/api/v5/account/positions-history?instType=SWAP&instId={inst_id}&limit=20"
-    r = await client.get(
-        f"{OKX_BASE_URL}{req_path}",
-        headers=okx_headers("GET", req_path, ""),
-        timeout=10.0,
-    )
-    r.raise_for_status()
-    res = r.json()
-    if res.get("code") != "0":
-        return None
-
-    for item in res.get("data", []):
-        u_time = int(item.get("uTime") or item.get("cTime") or "0")
-        if u_time >= opened_at_ms - 5000:
-            return item
-    return res["data"][0] if res.get("data") else None
-
-
-def classify_exit_and_metrics(pos_meta: dict, closed_rec: Optional[dict], fallback_px: float) -> tuple[str, float, float]:
-    side = pos_meta["side"]
-    entry_px = pos_meta["entry_px"]
-    tp_px = pos_meta["tp"]
-    sl_px = pos_meta["sl"]
-
-    exit_px = fallback_px
-    realized_pnl = 0.0
-
-    if closed_rec:
-        raw_exit = closed_rec.get("closeAvgPx") or closed_rec.get("avgPx")
-        if raw_exit:
-            try:
-                val = float(raw_exit)
-                if val > 0:
-                    exit_px = val
-            except ValueError:
-                pass
-
-        for field in ("realizedPnl", "pnl", "settledPnl"):
-            if closed_rec.get(field) not in (None, ""):
-                try:
-                    realized_pnl = float(closed_rec[field])
-                    break
-                except ValueError:
-                    pass
-
-    if side == "LONG":
-        price_move_pct = ((exit_px - entry_px) / entry_px) * 100.0 if entry_px > 0 else 0.0
-    else:
-        price_move_pct = ((entry_px - exit_px) / entry_px) * 100.0 if entry_px > 0 else 0.0
-
-    dist_tp = abs(exit_px - tp_px)
-    dist_sl = abs(exit_px - sl_px)
-    tol = max(abs(tp_px - sl_px) * 0.15, entry_px * 0.001)
-
-    if dist_tp <= tol and dist_tp < dist_sl:
-        outcome = "TP"
-    elif dist_sl <= tol and dist_sl < dist_tp:
-        outcome = "SL"
-    else:
-        outcome = "TP" if price_move_pct >= 0 else "SL"
-
-    return outcome, price_move_pct, realized_pnl
-
-
-async def monitor_positions_loop() -> None:
-    while True:
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
-        if not (OKX_API_KEY and OKX_SECRET_KEY and OKX_PASSPHRASE):
-            continue
-
-        try:
-            async with state_lock:
-                if not tracked_positions:
-                    continue
-                snapshot = dict(tracked_positions)
-
-            async with httpx.AsyncClient() as client:
-                open_positions = await fetch_open_swap_positions(client)
-
-                for inst_id, meta in snapshot.items():
-                    if inst_id in open_positions:
-                        continue
-
-                    try:
-                        last_px = await get_last_price(client, inst_id)
-                    except Exception:
-                        last_px = meta["entry_px"]
-
-                    closed_rec = await fetch_closed_position_record(
-                        client=client,
-                        inst_id=inst_id,
-                        opened_at_ms=meta["opened_at_ms"],
-                    )
-                    outcome, move_pct, pnl_usdt = classify_exit_and_metrics(meta, closed_rec, last_px)
-
-                    async with state_lock:
-                        tracked_positions.pop(inst_id, None)
-
-                    sign_move = "+" if move_pct >= 0 else ""
-                    sign_pnl = "+" if pnl_usdt >= 0 else ""
-                    msg = (
-                        f"Закрытие позиции\n"
-                        f"Монета: {inst_id}\n"
-                        f"Направление: {meta['side']}\n"
-                        f"Результат: {outcome}\n"
-                        f"Движение цены: {sign_move}{move_pct:.2f}%\n"
-                        f"PnL: {sign_pnl}{pnl_usdt:.4f} USDT"
-                    )
-                    await send_tg_message(client, msg)
-
-        except Exception as exc:
-            print(f"[MONITOR ERROR] {exc}")
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    task = asyncio.create_task(monitor_positions_loop())
-    try:
-        yield
-    finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-
-app = FastAPI(title="OKX Cross Webhook + TG Tracker", lifespan=lifespan)
+app = FastAPI(title="OKX Cross Webhook")
 
 
 @app.post("/webhook")
@@ -453,18 +293,6 @@ async def webhook(request: Request):
                 tp_str=tp_str,
                 sl_str=sl_str,
             )
-
-            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            async with state_lock:
-                tracked_positions[inst_id] = {
-                    "side": sig["side"],
-                    "tp": float(tp_str),
-                    "sl": float(sl_str),
-                    "entry_px": price,
-                    "margin_usdt": margin,
-                    "leverage": applied_lev,
-                    "opened_at_ms": now_ms,
-                }
 
             dot = "🟢" if sig["side"] == "LONG" else "🔴"
             open_msg = (
