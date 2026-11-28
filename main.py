@@ -247,6 +247,7 @@ async def place_cross_order_with_tpsl(
         raise HTTPException(status_code=400, detail=f"Order failed: {res}")
     return res
 
+
 async def fetch_open_swap_positions(client: httpx.AsyncClient) -> dict[str, dict]:
     req_path = "/api/v5/account/positions?instType=SWAP"
     r = await client.get(
@@ -419,6 +420,8 @@ async def webhook(request: Request):
         async with httpx.AsyncClient() as client:
             inst = await get_instrument_info(client, inst_id)
             price = await get_last_price(client, inst_id)
+            tick_sz = inst.get("tickSz", "0.01")
+            entry_str = format_by_tick(price, tick_sz)
 
             max_lev = int(float(inst.get("lever", "20")))
             applied_lev = await set_max_cross_leverage(client, inst_id, max_lev)
@@ -426,7 +429,6 @@ async def webhook(request: Request):
             ct_val = float(inst.get("ctVal", "1"))
             lot_sz = float(inst.get("lotSz", "1"))
             min_sz = float(inst.get("minSz", str(lot_sz)))
-            tick_sz = inst.get("tickSz", "0.01")
 
             lot_decimals = decimals_from_step(str(lot_sz))
             notional_usdt = margin * applied_lev
@@ -464,12 +466,12 @@ async def webhook(request: Request):
                     "opened_at_ms": now_ms,
                 }
 
+            dot = "🟢" if sig["side"] == "LONG" else "🔴"
             open_msg = (
-                f"Открыта позиция\n"
+                f"{dot} Вход: {sig['side']}\n"
                 f"Монета: {inst_id}\n"
-                f"Направление: {sig['side']}\n"
                 f"Маржа: {margin:.2f} USDT | Плечо: {applied_lev}x\n"
-                f"TP: {tp_str} | SL: {sl_str}"
+                f"Вход: {entry_str} | TP: {tp_str} | SL: {sl_str}"
             )
             await send_tg_message(client, open_msg)
 
@@ -477,6 +479,7 @@ async def webhook(request: Request):
             "status": "ok",
             "instId": inst_id,
             "side": sig["side"],
+            "entry": entry_str,
             "margin_usdt": margin,
             "leverage": applied_lev,
             "contracts": sz_str,
